@@ -1,5 +1,3 @@
-
-
 import pandas as pd
 import numpy as np
 
@@ -12,7 +10,10 @@ import numpy as np
 # the SAME value. If False (default), whitespace differences in data values
 # are preserved as real differences, matching the same "be exact" philosophy
 # requested for column names.
-STRIP_WHITESPACE_IN_DATA_VALUES = False
+# Comparison is deliberately insensitive to incidental outer whitespace; it
+# does not alter internal whitespace ("New York" remains different from
+# "NewYork").
+STRIP_WHITESPACE_IN_DATA_VALUES = True
 
 
 # Sentinel used internally to represent "missing" (NaN/None/NaT) so that
@@ -28,12 +29,72 @@ _MISSING_SENTINEL = "<<<__MISSING__>>>"
 # can force specific columns here if auto-detection misses them:
 FORCE_TIME_COLUMNS = []  # e.g. ["Start Time", "Doors Closed"]
 
+# Columns whose values are dates/datetimes will be converted to "MM-DD-YYYY"
+# text (time-of-day dropped entirely) before comparison AND before the
+# source file is saved/archived. Detection is automatic (see
+# _looks_like_date_series below), but you can force specific columns here if
+# auto-detection misses them:
+FORCE_DATE_COLUMNS = []  # e.g. ["Flight Date", "Booking Date"]
+
+
+# ============================================================================
+# RESULT HIGHLIGHTING CONFIGURATION (NEW -- output formatting only)
+# ============================================================================
+# These control the cell fill colors applied to the GENERATED RESULT
+# workbook after it is written. Nothing here affects comparison logic in any
+# way -- the comparison runs exactly as before, and this is purely a
+# post-processing pass over the finished output file so the differences that
+# were already identified are visually obvious instead of having to be
+# hunted for by eye.
+#
+# All colors are deliberately LIGHT/pastel so black cell text stays readable
+# and printing/screenshotting the report still looks clean. Values are plain
+# 6-digit RRGGBB hex strings (openpyxl format, no leading '#').
+HIGHLIGHT_RESULTS = True                 # set False to write a plain, unhighlighted workbook
+
+HIGHLIGHT_CHANGED_VALUE_COLOR = "FFF2CC"  # light amber  -- a value that differs between A and B
+HIGHLIGHT_EXTRA_IN_A_COLOR    = "FCE4E4"  # light red    -- rows/columns present (or excess) in A only
+HIGHLIGHT_EXTRA_IN_B_COLOR    = "DDEBF7"  # light blue   -- rows/columns present (or excess) in B only
+HIGHLIGHT_SUMMARY_COLOR       = "FFF2CC"  # light amber  -- non-zero difference metrics on Summary
+
+# Autofill changes source data before comparison; they are not a separate
+# comparison result and therefore must not receive their own report colour.
+HIGHLIGHT_AUTOFILLED_VALUES = False
+HIGHLIGHT_AUTOFILLED_COLOR = "E2F0D9"
+
 
 # ============================================================================
 # STEP 0: LOAD
 # ============================================================================
 
-def load_sheet(path, sheet_name=0):
+def expand_powerbi_merged_cells(path, sheet_name=0):
+    """Expand merged cells in one worksheet and save the workbook.
+
+    Excel stores a value only in the top-left cell of a merged range.  The
+    range is unmerged first because openpyxl's other cells in a merged range
+    are read-only, then that top-left value is written to every former member
+    of the range.  This deliberately affects only ranges Excel explicitly
+    marks as merged; ordinary blank cells are left untouched.
+    """
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path)
+    ws = wb.worksheets[sheet_name] if isinstance(sheet_name, int) else wb[sheet_name]
+
+    # Copy because unmerge_cells changes ws.merged_cells.ranges while iterating.
+    for merged_range in list(ws.merged_cells.ranges):
+        min_col, min_row, max_col, max_row = merged_range.bounds
+        value = ws.cell(row=min_row, column=min_col).value
+        ws.unmerge_cells(str(merged_range))
+        for row in ws.iter_rows(min_row=min_row, max_row=max_row,
+                                min_col=min_col, max_col=max_col):
+            for cell in row:
+                cell.value = value
+
+    wb.save(path)
+
+
+def load_sheet(path, sheet_name=0, expand_powerbi_merges=False):
     """
     Load a single sheet from an .xlsx file, preserving column headers
     EXACTLY as written (no auto-stripping of whitespace), so that a header
@@ -54,6 +115,11 @@ def load_sheet(path, sheet_name=0):
         openpyxl/pandas naturally infers them (dtype normalization happens
         later, explicitly, in compare_data()).
     """
+    if expand_powerbi_merges:
+        # Save the expanded workbook before pandas reads it, so both the
+        # dataframe and the later archive contain every propagated value.
+        expand_powerbi_merged_cells(path, sheet_name)
+
     # engine="openpyxl" reads .xlsx reliably; dtype=object keeps pandas from
     # silently coercing types on read (e.g. turning "007" into 7), so we can
     # inspect and normalize types ourselves in a controlled, visible step.
@@ -85,18 +151,210 @@ def load_sheet(path, sheet_name=0):
 FORWARD_FILL_COLUMNS = []  # e.g. ["Entry Date", "StaffID", "Full Name"]
 
 
+# MODIFIED: FORWARD FILL
+# NEW: AUTO-FILL TRACKING
 def forward_fill_merged_cells(df, columns):
     """
     Forward-fills blank cells in the given columns, on the assumption that
     the blanks come from merged cells in the original spreadsheet (a value
     only present on the first row of a repeated block). Returns a NEW
-    dataframe -- does not mutate the input.
+    dataframe -- does not mutate the input.  Also returns a set of
+    ``(column_name, original_dataframe_index)`` pairs for precisely the
+    cells that changed from blank to a prior value.
     """
     df = df.copy()
+    autofilled_cells = set()
     for col in columns:
         if col in df.columns:
-            df[col] = df[col].ffill()
+            # ffill only recognizes NaN, while exports often represent blank
+            # merged cells as empty/whitespace strings.  Convert those to
+            # missing first.  pandas leaves leading missing values missing,
+            # which is the required first-row behavior.
+            values = df[col].copy()
+            blank = values.isna() | values.map(lambda v: isinstance(v, str) and not v.strip())
+            filled = values.mask(blank).ffill()
+            # A leading blank remains missing after ffill and was not
+            # auto-filled.  Only record cells for which ffill supplied a
+            # usable previous value.
+            actually_filled = blank & filled.notna()
+            autofilled_cells.update((col, index) for index in df.index[actually_filled])
+            df[col] = filled
+    return df, autofilled_cells
+
+
+# MODIFIED: AUTO-FILL PROMPT (preserves tracking information)
+def prompt_for_autofill(df, sheet_label):
+    """Interactively forward-fill only columns explicitly selected by user."""
+    while True:
+        print(f"\nDo you want to autofill any columns in {sheet_label}?")
+        print("1. Yes\n2. No")
+        choice = input("Select 1 or 2: ").strip()
+        if choice == "2":
+            return df, set()
+        if choice == "1":
+            break
+        print("Please enter 1 (Yes) or 2 (No).")
+
+    columns = list(df.columns)
+    print(f"Available {sheet_label} columns:")
+    for number, column in enumerate(columns, start=1):
+        print(f"  {number}. {column}")
+    while True:
+        selected = input("Select one or more column numbers (comma-separated): ").strip()
+        try:
+            indices = [int(item.strip()) for item in selected.split(",") if item.strip()]
+            if not indices or any(index < 1 or index > len(columns) for index in indices):
+                raise ValueError
+            selected_columns = list(dict.fromkeys(columns[index - 1] for index in indices))
+            return forward_fill_merged_cells(df, selected_columns)
+        except ValueError:
+            print("Enter one or more valid column numbers, separated by commas.")
+
+
+# ============================================================================
+# DATE COLUMN DETECTION + CONVERSION (MM-DD-YYYY, time dropped entirely)
+# ============================================================================
+# This section is new. It is used both to normalize dates for comparison
+# and -- unlike the pre-existing internal-only normalization used inside
+# normalize_dataframe() -- to actually rewrite the source DataFrame (and,
+# in the folder workflow, the source file on disk) so the converted
+# MM-DD-YYYY values are what gets archived.
+
+import re
+
+
+def _parses_as_date_string(s):
+    """
+    True if `s` (a stripped string) contains an explicit date separator
+    ('-' or '/') AND pandas can parse it as a real date. Requiring a
+    separator is what keeps plain numeric IDs like "100" or "77960"
+    (flight numbers, pax counts, etc.) from ever being mistaken for dates
+    just because they happen to be numeric.
+    """
+    if not s or not re.search(r"[-/]", s):
+        return False
+    parsed = pd.to_datetime(s, errors="coerce")
+    return not pd.isna(parsed)
+
+
+def _looks_like_date_series(series):
+    """
+    Heuristic: does this column hold date/datetime values? Two ways in:
+      1. Native date/datetime objects (Timestamp/datetime/date/
+         np.datetime64) -- this is how openpyxl represents Excel
+         date-formatted cells even though load_sheet() uses dtype=object,
+         so this signal is unambiguous. datetime.time values (clock times,
+         no date component) are explicitly excluded -- those belong to the
+         separate time-column pipeline above, not this one.
+      2. Text values that contain a date separator and parse cleanly via
+         pandas (see _parses_as_date_string) -- this deliberately excludes
+         plain digit strings so ID/flight-number/pax-count columns are
+         never converted just because they're numeric.
+    ALL sampled non-null values must match for the column to be treated as
+    a date column, so a column that's mostly free text is left alone even
+    if one value happens to be parseable.
+    """
+    import datetime  # local import: avoids clashing with the module-level
+                      # "from datetime import datetime" used further down
+                      # for the folder-workflow timestamp logic.
+    sample = series.dropna()
+    if len(sample) == 0:
+        return False
+    sample = sample.head(20)
+    hits = 0
+    for v in sample:
+        if isinstance(v, datetime.time):
+            continue
+        if isinstance(v, (pd.Timestamp, datetime.datetime, datetime.date, np.datetime64)):
+            hits += 1
+        elif isinstance(v, str) and _parses_as_date_string(v.strip()):
+            hits += 1
+    return hits == len(sample)
+
+
+def _to_mmddyyyy(v):
+    """
+    Convert a single date/datetime-like value to 'MM-DD-YYYY' text, with
+    the time-of-day component (hours/minutes/seconds/milliseconds) dropped
+    entirely. Non-date and missing values pass through unchanged.
+    """
+    import datetime  # local import: see note in _looks_like_date_series
+    if v is None:
+        return v
+    if isinstance(v, float) and pd.isna(v):
+        return v
+    if isinstance(v, datetime.time):
+        return v  # not a date value -- leave untouched
+    if isinstance(v, (pd.Timestamp, datetime.datetime, datetime.date, np.datetime64, str)):
+        parsed = pd.to_datetime(v, errors="coerce")
+        if not pd.isna(parsed):
+            return parsed.strftime("%m-%d-%Y")
+    return v
+
+
+def convert_date_columns_to_mmddyyyy(df, force_columns=None):
+    """
+    Detects date-related columns in `df` (dynamically via
+    _looks_like_date_series, plus any explicit overrides passed in
+    `force_columns` or listed in FORCE_DATE_COLUMNS) and converts their
+    values to 'MM-DD-YYYY' text, dropping the time-of-day portion
+    completely. Returns a NEW dataframe -- does not mutate the input.
+
+    Columns that merely contain numbers (flight numbers, IDs, pax counts,
+    etc.) are left completely untouched, since detection requires either a
+    real date/datetime object or a text value with an explicit date
+    separator that pandas can parse.
+    """
+    df = df.copy()
+    force = set(force_columns or []) | set(FORCE_DATE_COLUMNS)
+    for col in df.columns:
+        if col in force or _looks_like_date_series(df[col]):
+            df[col] = df[col].map(_to_mmddyyyy)
     return df
+
+
+# ============================================================================
+# WRITE MODIFIED DATA BACK TO THE SOURCE FILE (so archives reflect changes)
+# ============================================================================
+
+def save_dataframe_to_source(df, path, sheet_name=0):
+    """
+    Writes `df` back to the ORIGINAL source file at `path`, overwriting its
+    data in place. Used so that any preprocessing applied in-memory
+    (autofill, date conversion, etc.) is reflected in the actual file
+    BEFORE that file gets moved to the archive folder.
+
+    - .csv / .tsv: the file is simply overwritten with the modified
+      dataframe.
+    - .xlsx / .xls: the existing workbook is loaded so other sheets and the
+      overall workbook structure are preserved; only the target sheet's
+      cell contents are cleared and rewritten from the dataframe.
+    """
+    from pathlib import Path as _Path
+    path = _Path(path)
+
+    if path.suffix.lower() in (".csv", ".tsv"):
+        sep = "\t" if path.suffix.lower() == ".tsv" else ","
+        df.to_csv(path, index=False, sep=sep)
+        return
+
+    import openpyxl
+    wb = openpyxl.load_workbook(path)
+    if isinstance(sheet_name, int):
+        ws = wb.worksheets[sheet_name]
+    else:
+        ws = wb[sheet_name]
+
+    # Clear existing rows on the target sheet only, then rewrite header +
+    # data from the (possibly modified) dataframe. Other sheets in the
+    # workbook are untouched.
+    if ws.max_row and ws.max_row > 0:
+        ws.delete_rows(1, ws.max_row)
+    ws.append([str(c) for c in df.columns])
+    for row in df.itertuples(index=False, name=None):
+        ws.append(list(row))
+
+    wb.save(path)
 
 
 # ============================================================================
@@ -105,8 +363,8 @@ def forward_fill_merged_cells(df, columns):
 
 def compare_schema(df_a, df_b):
     """
-    Compare column headers between two sheets using EXACT string matching
-    (case-sensitive, whitespace-sensitive -- no trimming or normalizing).
+    Compare headers after trimming only leading/trailing whitespace.  The
+    returned common names preserve Sheet A's original display names.
 
     Returns
     -------
@@ -122,20 +380,37 @@ def compare_schema(df_a, df_b):
     cols_a = list(df_a.columns)
     cols_b = list(df_b.columns)
 
-    set_a = set(cols_a)
-    set_b = set(cols_b)
-
-    only_in_a = [c for c in cols_a if c not in set_b]
-    only_in_b = [c for c in cols_b if c not in set_a]
-    common = [c for c in cols_a if c in set_b]  # order: as they appear in A
+    normalize_header = lambda c: c.strip() if isinstance(c, str) else c
+    normalized_a = [normalize_header(c) for c in cols_a]
+    normalized_b = [normalize_header(c) for c in cols_b]
+    # Ambiguous headers cannot be safely matched after trimming.
+    if len(set(normalized_a)) != len(normalized_a) or len(set(normalized_b)) != len(normalized_b):
+        raise ValueError("A sheet has duplicate column names after trimming leading/trailing whitespace.")
+    set_a, set_b = set(normalized_a), set(normalized_b)
+    only_in_a = [c for c, normalized in zip(cols_a, normalized_a) if normalized not in set_b]
+    only_in_b = [c for c, normalized in zip(cols_b, normalized_b) if normalized not in set_a]
+    common = [c for c, normalized in zip(cols_a, normalized_a) if normalized in set_b]
+    b_name_by_normalized = dict(zip(normalized_b, cols_b))
+    common_b = [b_name_by_normalized[normalize_header(c)] for c in common]
 
     return {
         "only_in_a": only_in_a,
         "only_in_b": only_in_b,
         "common": common,
+        "common_b": common_b,
         "count_a": len(cols_a),
         "count_b": len(cols_b),
     }
+
+
+def align_common_headers(df_b, schema):
+    """Give B's whitespace-equivalent common headers A's display names.
+
+    This alignment is confined to the in-memory comparison dataframe. Source
+    headers remain untouched when files are loaded and archived.
+    """
+    rename_map = dict(zip(schema["common_b"], schema["common"]))
+    return df_b.rename(columns=rename_map)
 
 
 # ============================================================================
@@ -204,6 +479,34 @@ def _normalize_time_value(v):
         if len(parts) == 2:
             s = s + ":00"
         return s
+    return v
+
+
+def _normalize_date_value(v):
+    """
+    Return MM-DD-YYYY for real datetimes and date-like text (time-of-day
+    dropped entirely), so comparison never treats two different times on
+    the same date as a mismatch.
+
+    NOTE: by the time this runs inside normalize_dataframe(), date columns
+    have typically already been converted to 'MM-DD-YYYY' strings by
+    convert_date_columns_to_mmddyyyy() upstream (see run_comparison /
+    run_folder_comparison). This function is kept so compare_data() /
+    normalize_dataframe() still behave correctly on their own, and so any
+    date-like value that slipped through unconverted is still normalized
+    consistently at comparison time.
+    """
+    import datetime
+
+    if isinstance(v, (pd.Timestamp, datetime.datetime, datetime.date, np.datetime64)):
+        parsed = pd.to_datetime(v, errors="coerce")
+        return parsed.strftime("%m-%d-%Y") if not pd.isna(parsed) else v
+    # Restrict text parsing to values that look like dates (contain a date
+    # separator), so ordinary identifiers and free text are never
+    # accidentally converted to dates.
+    if isinstance(v, str) and _parses_as_date_string(v.strip()):
+        parsed = pd.to_datetime(v.strip(), errors="coerce")
+        return parsed.strftime("%m-%d-%Y") if not pd.isna(parsed) else v
     return v
 
 
@@ -280,7 +583,8 @@ def _normalize_value(v, strip_whitespace):
     return str(v)  # safety net -- see docstring above
 
 
-def normalize_dataframe(df, columns, apply_numeric_normalization=True):
+def normalize_dataframe(df, columns, apply_numeric_normalization=True,
+                        apply_previous_value_fill=False):
     """
     Apply the configured normalization steps to `columns` of `df`, returning
     a NEW dataframe (does not mutate the input). This is the single place
@@ -306,18 +610,18 @@ def normalize_dataframe(df, columns, apply_numeric_normalization=True):
     out = df[columns].copy()
 
     for col in columns:
+        if apply_previous_value_fill:
+            # This is comparison-time Tableau expansion.  It does not alter
+            # the source dataframe or fill a leading blank from a future row.
+            values = out[col]
+            blank = values.isna() | values.map(lambda v: isinstance(v, str) and not v.strip())
+            out[col] = values.mask(blank).ffill()
         is_time_col = col in FORCE_TIME_COLUMNS or _looks_like_time_series(out[col])
 
         def _norm(v, is_time_col=is_time_col):
+            v = _normalize_date_value(v)
             if is_time_col:
                 v = _normalize_time_value(v)
-            # NOTE: date/datetime normalization was removed at the user's
-            # request. Date-like columns are NOT reformatted here -- if one
-            # sheet stores a date as text and the other as a real date
-            # object, they will show up as different. The final str()
-            # safety net in _normalize_value() below still guarantees this
-            # can't crash the comparison (e.g. a pd.merge dtype error) --
-            # it just means date columns compare literally, as-is.
             if apply_numeric_normalization:
                 v = _normalize_numeric_like(v)
             return _normalize_value(v, STRIP_WHITESPACE_IN_DATA_VALUES)
@@ -336,7 +640,8 @@ def normalize_dataframe(df, columns, apply_numeric_normalization=True):
 # STEP 3: DATA COMPARISON (multiset / bag comparison)
 # ============================================================================
 
-def compare_data(df_a, df_b, common_columns):
+def compare_data(df_a, df_b, common_columns, tableau_previous_value_fill=True,
+                 autofilled_cells_a=None, autofilled_cells_b=None):
     """
     Multiset comparison of df_a and df_b restricted to `common_columns`.
 
@@ -364,7 +669,8 @@ def compare_data(df_a, df_b, common_columns):
         'extra_in_b' : same, reversed.
     """
     # --- normalize both sides identically before grouping ---
-    norm_a = normalize_dataframe(df_a, common_columns)
+    norm_a = normalize_dataframe(df_a, common_columns,
+                                 apply_previous_value_fill=tableau_previous_value_fill)
     norm_b = normalize_dataframe(df_b, common_columns)
 
     # --- STEP: group by the full row-tuple and count occurrences ---
@@ -408,13 +714,18 @@ def compare_data(df_a, df_b, common_columns):
     # human review it's more useful to show the actual original data. We do
     # this by taking one representative original row per matched normalized
     # tuple from the sheet that has extra copies.
-    extra_in_a = _attach_original_values(extra_in_a, df_a, common_columns, norm_a)
-    extra_in_b = _attach_original_values(extra_in_b, df_b, common_columns, norm_b)
+    extra_in_a = _attach_original_values(
+        extra_in_a, df_a, common_columns, norm_a, autofilled_cells_a
+    )
+    extra_in_b = _attach_original_values(
+        extra_in_b, df_b, common_columns, norm_b, autofilled_cells_b
+    )
 
     return {"extra_in_a": extra_in_a, "extra_in_b": extra_in_b}
 
 
-def _attach_original_values(result_df, original_df, common_columns, normalized_df):
+def _attach_original_values(result_df, original_df, common_columns, normalized_df,
+                            autofilled_cells=None):
     """
     result_df currently holds NORMALIZED values for common_columns (since it
     came from grouping on normalized_df) plus CountInA/CountInB. Replace the
@@ -423,7 +734,9 @@ def _attach_original_values(result_df, original_df, common_columns, normalized_d
     data rather than sentinel-substituted/type-coerced strings.
     """
     if result_df.empty:
-        return result_df.reset_index(drop=True)
+        result_df = result_df.reset_index(drop=True)
+        result_df.attrs["autofilled_columns_by_row"] = {}
+        return result_df
 
     # Attach a temporary key to normalized_df so we can look up, per
     # normalized tuple, the index of one matching original row.
@@ -444,6 +757,14 @@ def _attach_original_values(result_df, original_df, common_columns, normalized_d
     orig_rows = original_df.loc[lookup["_orig_index"]].reset_index(drop=True)
     orig_rows["CountInA"] = lookup["CountInA"].values
     orig_rows["CountInB"] = lookup["CountInB"].values
+    # NEW: AUTO-FILL TRACKING
+    # Keep display-only provenance outside the dataframe columns so the
+    # generated workbook structure remains exactly unchanged.
+    tracked = autofilled_cells or set()
+    orig_rows.attrs["autofilled_columns_by_row"] = {
+        output_row: {column for column, source_row in tracked if source_row == original_row}
+        for output_row, original_row in enumerate(lookup["_orig_index"])
+    }
     return orig_rows
 
 
@@ -564,6 +885,9 @@ def find_likely_edited_pairs(extra_in_a, extra_in_b, common_columns,
             "unmatched_a": extra_in_a,
             "unmatched_b": extra_in_b,
             "skipped": True,
+            "pair_autofilled": {},
+            "unmatched_autofilled_a": {},
+            "unmatched_autofilled_b": {},
         }
 
     # Expand each row out by its "excess count" (CountInA - CountInB, or
@@ -580,11 +904,15 @@ def find_likely_edited_pairs(extra_in_a, extra_in_b, common_columns,
     # though they mean the same thing, falsely inflating DifferingColumns.
     def _expand(df, norm_df, count_col_self, count_col_other):
         rows = []
+        autofilled_by_row = df.attrs.get("autofilled_columns_by_row", {})
         for idx, row in df.iterrows():
             excess = int(row[count_col_self]) - int(row[count_col_other])
             norm_row = norm_df.loc[idx]
             for _ in range(max(excess, 0)):
                 combined = row.copy()
+                # Internal-only marker. It is removed before any dataframe
+                # is written to the report workbook.
+                combined["__autofilled_columns__"] = autofilled_by_row.get(idx, set())
                 for col in common_columns:
                     combined[f"__norm__{col}"] = norm_row[col]
                 rows.append(combined)
@@ -601,6 +929,7 @@ def find_likely_edited_pairs(extra_in_a, extra_in_b, common_columns,
     unmatched_b_idx = set(pool_b.index)
     pair_records = []
     full_pair_records = []
+    pair_autofilled = {}
     unmatched_a_idx = []
     pair_id = 0
 
@@ -629,6 +958,13 @@ def find_likely_edited_pairs(extra_in_a, extra_in_b, common_columns,
             unmatched_b_idx.discard(best_j)
             row_b = pool_b.loc[best_j]
             pair_id += 1
+            # NEW: AUTO-FILL TRACKING -- side/column provenance for the two
+            # mismatched report formats.  This is never added as a result
+            # column, so it cannot affect comparison output.
+            pair_autofilled[pair_id] = {
+                "A": set(row_a.get("__autofilled_columns__", set())),
+                "B": set(row_b.get("__autofilled_columns__", set())),
+            }
             for col in best_diff_cols:
                 pair_records.append({
                     "PairID": pair_id,
@@ -677,8 +1013,8 @@ def find_likely_edited_pairs(extra_in_a, extra_in_b, common_columns,
     # display_cols must be computed PER SIDE, not shared -- pool_a and
     # pool_b can have different columns whenever Sheet A/B schemas differ
     # (e.g. extra columns added to only one sheet).
-    display_cols_a = [c for c in pool_a.columns if not c.startswith("__norm__")]
-    display_cols_b = [c for c in pool_b.columns if not c.startswith("__norm__")]
+    display_cols_a = [c for c in pool_a.columns if not c.startswith("__")]
+    display_cols_b = [c for c in pool_b.columns if not c.startswith("__")]
     unmatched_a_df = (
         pool_a.loc[unmatched_a_idx, display_cols_a].reset_index(drop=True)
         if unmatched_a_idx else pool_a.loc[:, display_cols_a].iloc[0:0]
@@ -687,12 +1023,341 @@ def find_likely_edited_pairs(extra_in_a, extra_in_b, common_columns,
         pool_b.loc[list(unmatched_b_idx), display_cols_b].reset_index(drop=True)
         if unmatched_b_idx else pool_b.loc[:, display_cols_b].iloc[0:0]
     )
+    unmatched_autofilled_a = {
+        output_row: set(pool_a.loc[pool_row, "__autofilled_columns__"])
+        for output_row, pool_row in enumerate(unmatched_a_idx)
+    }
+    unmatched_autofilled_b = {
+        output_row: set(pool_b.loc[pool_row, "__autofilled_columns__"])
+        for output_row, pool_row in enumerate(list(unmatched_b_idx))
+    }
     return {
         "pairs": pairs_df,             # long format: one row per differing field
         "pairs_full": pairs_full_df,   # wide format: full A + B record per pair
         "unmatched_a": unmatched_a_df,
         "unmatched_b": unmatched_b_df,
         "skipped": False,
+        "pair_autofilled": pair_autofilled,
+        "unmatched_autofilled_a": unmatched_autofilled_a,
+        "unmatched_autofilled_b": unmatched_autofilled_b,
+    }
+
+
+# ============================================================================
+# RESULT HIGHLIGHTING (NEW -- runs AFTER the result workbook is written)
+# ============================================================================
+# Everything below is pure output formatting. It re-opens the finished
+# result .xlsx with openpyxl and paints a light background fill on the cells
+# that represent the differences ALREADY identified by the comparison above.
+# No comparison logic is re-run, no values are recalculated, and no data is
+# added, removed, or reordered -- only cell fill colors are set. If anything
+# in here fails for any reason, the failure is caught and reported, and the
+# (already complete and correct) workbook is simply left unhighlighted.
+#
+# Colour key, applied consistently across every sheet:
+#   light amber (HIGHLIGHT_CHANGED_VALUE_COLOR) -> a value that DIFFERS
+#   light red   (HIGHLIGHT_EXTRA_IN_A_COLOR)    -> present/excess in A only
+#   light blue  (HIGHLIGHT_EXTRA_IN_B_COLOR)    -> present/excess in B only
+
+def _solid_fill(hex_color):
+    """Build a solid openpyxl PatternFill from a 6-digit RRGGBB hex string."""
+    from openpyxl.styles import PatternFill
+    return PatternFill(start_color=hex_color, end_color=hex_color, fill_type="solid")
+
+
+def _header_index_map(ws):
+    """
+    Map {header text -> 1-based column index} by reading row 1 of a
+    worksheet. Reading the headers back off the sheet (rather than assuming
+    a fixed column order) keeps this robust if the column layout of any
+    result sheet ever changes.
+    """
+    headers = {}
+    for cell in ws[1]:
+        if cell.value is not None:
+            headers[str(cell.value)] = cell.column
+    return headers
+
+
+def _highlight_entire_data_rows(ws, fill):
+    """Fill every populated data cell (row 2 downward) on a worksheet."""
+    if ws.max_row is None or ws.max_row < 2:
+        return 0
+    filled_rows = 0
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row,
+                            min_col=1, max_col=ws.max_column):
+        for cell in row:
+            cell.fill = fill
+        filled_rows += 1
+    return filled_rows
+
+
+def _highlight_column_by_name(ws, header_name, fill):
+    """Fill every data cell under one named column, if that column exists."""
+    headers = _header_index_map(ws)
+    col_idx = headers.get(header_name)
+    if not col_idx or ws.max_row is None or ws.max_row < 2:
+        return 0
+    count = 0
+    for row_idx in range(2, ws.max_row + 1):
+        ws.cell(row=row_idx, column=col_idx).fill = fill
+        count += 1
+    return count
+
+
+def _highlight_mismatched_records(ws, fill, autofilled_by_pair=None, autofill_fill=None):
+    """
+    MismatchedRecords (wide format): for each matched pair, read that row's
+    'DifferingColumns' value and highlight ONLY the '<col> [A]' and
+    '<col> [B]' cells for the columns actually named there. Columns that
+    matched between the two sheets stay unhighlighted, so what changed
+    jumps out immediately even on a very wide record.
+    """
+    headers = _header_index_map(ws)
+    diff_idx = headers.get("DifferingColumns")
+    if not diff_idx or ws.max_row is None or ws.max_row < 2:
+        return 0
+
+    highlighted = 0
+    for row_idx in range(2, ws.max_row + 1):
+        pair_id = ws.cell(row=row_idx, column=headers.get("PairID", 1)).value
+        raw = ws.cell(row=row_idx, column=diff_idx).value
+        if raw not in (None, "", "(identical)"):
+            for name in [part.strip() for part in str(raw).split(",") if part.strip()]:
+                for suffix in ("[A]", "[B]"):
+                    col_idx = headers.get(f"{name} {suffix}")
+                    if col_idx:
+                        ws.cell(row=row_idx, column=col_idx).fill = fill
+                        highlighted += 1
+            # Also tint the DifferingColumns cell itself so the row is easy to
+            # spot when scrolling horizontally through a wide pair record.
+            ws.cell(row=row_idx, column=diff_idx).fill = fill
+        # NEW: AUTO-FILL HIGHLIGHTING. Apply last, making green the explicit
+        # precedence when a value is both changed and auto-filled.
+        for side, suffix in (("A", "[A]"), ("B", "[B]")):
+            for name in (autofilled_by_pair or {}).get(pair_id, {}).get(side, set()):
+                col_idx = headers.get(f"{name} {suffix}")
+                if col_idx and autofill_fill:
+                    ws.cell(row=row_idx, column=col_idx).fill = autofill_fill
+    return highlighted
+
+
+def _highlight_mismatched_records_short(ws, fill_a, fill_b, fill_changed,
+                                        autofilled_by_pair=None, autofill_fill=None):
+    """
+    MismatchedRecordsShort (long format): every row here IS a difference,
+    so highlight the Column name (amber), the A value (light red) and the
+    B value (light blue) -- side-by-side colours make it obvious at a glance
+    which sheet each value came from.
+    """
+    headers = _header_index_map(ws)
+    if ws.max_row is None or ws.max_row < 2:
+        return 0
+    targets = [
+        ("Column", fill_changed),
+        ("ValueInA", fill_a),
+        ("ValueInB", fill_b),
+    ]
+    count = 0
+    for row_idx in range(2, ws.max_row + 1):
+        for header_name, fill in targets:
+            col_idx = headers.get(header_name)
+            if col_idx:
+                ws.cell(row=row_idx, column=col_idx).fill = fill
+                count += 1
+        # NEW: AUTO-FILL HIGHLIGHTING -- green takes precedence over the
+        # normal A/B difference colour for the actual supplied value cell.
+        pair_id = ws.cell(row=row_idx, column=headers.get("PairID", 1)).value
+        column_name = ws.cell(row=row_idx, column=headers.get("Column", 1)).value
+        pair_info = (autofilled_by_pair or {}).get(pair_id, {})
+        for side, header_name in (("A", "ValueInA"), ("B", "ValueInB")):
+            if column_name in pair_info.get(side, set()):
+                col_idx = headers.get(header_name)
+                if col_idx and autofill_fill:
+                    ws.cell(row=row_idx, column=col_idx).fill = autofill_fill
+    return count
+
+
+# NEW: AUTO-FILL HIGHLIGHTING
+def _highlight_autofilled_rows(ws, autofilled_by_row, fill):
+    """Highlight only tracked source-value cells in a direct row report."""
+    if not autofilled_by_row or ws.max_row is None or ws.max_row < 2:
+        return 0
+    headers = _header_index_map(ws)
+    count = 0
+    for output_row, columns in autofilled_by_row.items():
+        for column in columns:
+            col_idx = headers.get(str(column))
+            if col_idx:
+                ws.cell(row=output_row + 2, column=col_idx).fill = fill
+                count += 1
+    return count
+
+
+# NEW: AUTO-FILL HIGHLIGHTING
+def _add_summary_legend(ws, fill_changed, fill_a, fill_b, fill_autofilled=None):
+    """Place a colour legend to the right of metrics without changing them."""
+    start_col = max(ws.max_column + 2, 4)
+    ws.cell(row=1, column=start_col, value="Color Legend")
+    entries = [
+        ("Changed Value", fill_changed),
+        ("Extra in A", fill_a),
+        ("Extra in B", fill_b),
+    ]
+    if fill_autofilled:
+        entries.append(("Auto-Filled Value", fill_autofilled))
+    for row, (label, fill) in enumerate(entries, start=2):
+        cell = ws.cell(row=row, column=start_col, value=label)
+        cell.fill = fill
+
+
+def _highlight_summary(ws, fill):
+    """
+    Summary: highlight the Value cell of any metric that represents a
+    detected difference and is NON-ZERO. Metrics that are simply
+    descriptive (file names, total column/row counts) and differences that
+    came out as zero are deliberately left plain, so the highlighted cells
+    are exactly the ones worth investigating.
+    """
+    headers = _header_index_map(ws)
+    metric_idx = headers.get("Metric")
+    value_idx = headers.get("Value")
+    if not metric_idx or not value_idx or ws.max_row is None or ws.max_row < 2:
+        return 0
+
+    difference_metrics = {
+        "Columns only in A",
+        "Columns only in B",
+        "Row count difference (A-B)",
+        "Distinct row-combos extra in A",
+        "Distinct row-combos extra in B",
+        "Likely-edited pairs found",
+        "Still-unmatched extra rows in A",
+        "Still-unmatched extra rows in B",
+    }
+
+    count = 0
+    for row_idx in range(2, ws.max_row + 1):
+        metric = ws.cell(row=row_idx, column=metric_idx).value
+        if metric not in difference_metrics:
+            continue
+        value = ws.cell(row=row_idx, column=value_idx).value
+        try:
+            is_nonzero = float(value) != 0
+        except (TypeError, ValueError):
+            is_nonzero = False
+        if is_nonzero:
+            ws.cell(row=row_idx, column=metric_idx).fill = fill
+            ws.cell(row=row_idx, column=value_idx).fill = fill
+            count += 1
+    return count
+
+
+def highlight_result_workbook(output_path, autofill_display=None):
+    """
+    Post-process the generated result workbook at `output_path`, applying a
+    light background fill to every cell that represents an identified
+    difference. Called at the very end of run_comparison() and
+    run_folder_comparison(), immediately after the workbook is written.
+
+    Sheet-by-sheet behaviour:
+      Summary                -> non-zero difference metrics (amber)
+      MissingInB             -> each column name found only in A (light red)
+      MissingInA             -> each column name found only in B (light blue)
+      ExtraInA               -> whole row (light red)
+      ExtraInB               -> whole row (light blue)
+      MismatchedRecords      -> only the '[A]'/'[B]' cells whose column is
+                                listed in that row's DifferingColumns (amber)
+      MismatchedRecordsShort -> Column (amber), ValueInA (red), ValueInB (blue)
+      UnmatchedInA           -> whole row (light red)
+      UnmatchedInB           -> whole row (light blue)
+
+    Purely cosmetic and fully optional: set HIGHLIGHT_RESULTS = False at the
+    top of the file to skip it, and any unexpected error here is caught and
+    printed without disturbing the workbook that was already written.
+    """
+    if not HIGHLIGHT_RESULTS:
+        return
+
+    try:
+        import openpyxl
+
+        fill_changed = _solid_fill(HIGHLIGHT_CHANGED_VALUE_COLOR)
+        fill_a = _solid_fill(HIGHLIGHT_EXTRA_IN_A_COLOR)
+        fill_b = _solid_fill(HIGHLIGHT_EXTRA_IN_B_COLOR)
+        fill_summary = _solid_fill(HIGHLIGHT_SUMMARY_COLOR)
+        fill_autofilled = _solid_fill(HIGHLIGHT_AUTOFILLED_COLOR) if HIGHLIGHT_AUTOFILLED_VALUES else None
+
+        wb = openpyxl.load_workbook(output_path)
+
+        if "Summary" in wb.sheetnames:
+            _highlight_summary(wb["Summary"], fill_summary)
+            _add_summary_legend(wb["Summary"], fill_changed, fill_a, fill_b, fill_autofilled)
+
+        # Schema differences: the single column of names on each sheet IS
+        # the difference, so the whole column gets tinted.
+        if "MissingInB" in wb.sheetnames:
+            _highlight_column_by_name(wb["MissingInB"], "ColumnOnlyInA", fill_a)
+        if "MissingInA" in wb.sheetnames:
+            _highlight_column_by_name(wb["MissingInA"], "ColumnOnlyInB", fill_b)
+
+        # Extra / unmatched rows: the ENTIRE row is the finding (this whole
+        # record is excess on one side), so the full row is tinted rather
+        # than any individual cell.
+        for sheet_name, fill in (
+            ("ExtraInA", fill_a),
+            ("ExtraInB", fill_b),
+            ("UnmatchedInA", fill_a),
+            ("UnmatchedInB", fill_b),
+        ):
+            if sheet_name in wb.sheetnames:
+                _highlight_entire_data_rows(wb[sheet_name], fill)
+
+        # Direct row reports retain their original displayed columns, so
+        # tracked source-row provenance identifies exact cells to repaint.
+        if HIGHLIGHT_AUTOFILLED_VALUES:
+            for sheet_name in ("ExtraInA", "ExtraInB", "UnmatchedInA", "UnmatchedInB"):
+                if sheet_name in wb.sheetnames:
+                    _highlight_autofilled_rows(
+                        wb[sheet_name], (autofill_display or {}).get(sheet_name, {}), fill_autofilled
+                    )
+
+        # Likely-edited pairs: only the fields that actually changed.
+        if "MismatchedRecords" in wb.sheetnames:
+            _highlight_mismatched_records(
+                wb["MismatchedRecords"], fill_changed,
+                (autofill_display or {}).get("MismatchedRecords", {}),
+                fill_autofilled if HIGHLIGHT_AUTOFILLED_VALUES else None,
+            )
+        if "MismatchedRecordsShort" in wb.sheetnames:
+            _highlight_mismatched_records_short(
+                wb["MismatchedRecordsShort"], fill_a, fill_b, fill_changed,
+                (autofill_display or {}).get("MismatchedRecordsShort", {}),
+                fill_autofilled if HIGHLIGHT_AUTOFILLED_VALUES else None,
+            )
+
+        wb.save(output_path)
+        print(
+            "Highlighting applied to result workbook "
+            f"(changed={HIGHLIGHT_CHANGED_VALUE_COLOR}, "
+            f"extra-in-A={HIGHLIGHT_EXTRA_IN_A_COLOR}, "
+            f"extra-in-B={HIGHLIGHT_EXTRA_IN_B_COLOR})."
+        )
+    except Exception as exc:  # never let cosmetics break a finished report
+        print(f"[WARNING] Could not apply highlighting to {output_path}: {exc}")
+        print("The result workbook itself was written successfully and is complete.")
+
+
+# NEW: AUTO-FILL TRACKING
+def _autofill_display_info(extra_in_a, extra_in_b, match_result):
+    """Collect non-tabular provenance used only by the formatting pass."""
+    return {
+        "ExtraInA": extra_in_a.attrs.get("autofilled_columns_by_row", {}),
+        "ExtraInB": extra_in_b.attrs.get("autofilled_columns_by_row", {}),
+        "UnmatchedInA": match_result.get("unmatched_autofilled_a", {}),
+        "UnmatchedInB": match_result.get("unmatched_autofilled_b", {}),
+        "MismatchedRecords": match_result.get("pair_autofilled", {}),
+        "MismatchedRecordsShort": match_result.get("pair_autofilled", {}),
     }
 
 
@@ -700,7 +1365,8 @@ def find_likely_edited_pairs(extra_in_a, extra_in_b, common_columns,
 # ORCHESTRATION
 # ============================================================================
 
-def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison_output.xlsx"):
+def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison_output.xlsx",
+                   interactive_autofill=True):
     """
     Runs the full comparison pipeline in order (schema -> row counts ->
     data), prints a console summary, and writes results to an output .xlsx
@@ -709,12 +1375,26 @@ def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison
     print("=" * 70)
     print("LOADING SHEETS")
     print("=" * 70)
-    df_a = load_sheet(path_a, sheet_a)
-    df_b = load_sheet(path_b, sheet_b)
+    # Merged ranges are a property of the actual source worksheet, not its
+    # SheetA/SheetB role. Expand them before reading either input.
+    df_a = load_sheet(path_a, sheet_a, expand_powerbi_merges=True)
+    df_b = load_sheet(path_b, sheet_b, expand_powerbi_merges=True)
+    autofilled_cells_a = set()
+    autofilled_cells_b = set()
+    if interactive_autofill:
+        df_a, autofilled_cells_a = prompt_for_autofill(df_a, "SheetA")
+        df_b, autofilled_cells_b = prompt_for_autofill(df_b, "SheetB")
     if FORWARD_FILL_COLUMNS:
         print(f"Forward-filling merged-cell columns: {FORWARD_FILL_COLUMNS}")
-        df_a = forward_fill_merged_cells(df_a, FORWARD_FILL_COLUMNS)
-        df_b = forward_fill_merged_cells(df_b, FORWARD_FILL_COLUMNS)
+        df_a, configured_cells_a = forward_fill_merged_cells(df_a, FORWARD_FILL_COLUMNS)
+        df_b, configured_cells_b = forward_fill_merged_cells(df_b, FORWARD_FILL_COLUMNS)
+        autofilled_cells_a.update(configured_cells_a)
+        autofilled_cells_b.update(configured_cells_b)
+    # Convert date/datetime columns to MM-DD-YYYY (time dropped) before the
+    # rest of the pipeline runs, so schema/row-count/data comparison all see
+    # the normalized date representation.
+    df_a = convert_date_columns_to_mmddyyyy(df_a)
+    df_b = convert_date_columns_to_mmddyyyy(df_b)
     print(f"Sheet A: {path_a!r} (sheet={sheet_a!r}) -> {df_a.shape[0]} rows, {df_a.shape[1]} cols")
     print(f"Sheet B: {path_b!r} (sheet={sheet_b!r}) -> {df_b.shape[0]} rows, {df_b.shape[1]} cols")
 
@@ -723,6 +1403,14 @@ def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison
     print("STEP 1: SCHEMA CHECK")
     print("=" * 70)
     schema = compare_schema(df_a, df_b)
+    df_b_comparison = align_common_headers(df_b, schema)
+    # Result sheets use Sheet A's display names for whitespace-equivalent
+    # common headers, so translate only the in-memory tracking labels too.
+    b_to_result_header = dict(zip(schema["common_b"], schema["common"]))
+    autofilled_cells_b = {
+        (b_to_result_header.get(column, column), row)
+        for column, row in autofilled_cells_b
+    }
     print(f"Total columns in A: {schema['count_a']}")
     print(f"Total columns in B: {schema['count_b']}")
     print(f"Columns only in A ({len(schema['only_in_a'])}): {schema['only_in_a']}")
@@ -748,7 +1436,9 @@ def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison
     print("=" * 70)
     print(f"Comparing on {len(schema['common'])} common columns.")
     print(f"STRIP_WHITESPACE_IN_DATA_VALUES = {STRIP_WHITESPACE_IN_DATA_VALUES}")
-    data_result = compare_data(df_a, df_b, schema["common"])
+    data_result = compare_data(df_a, df_b_comparison, schema["common"],
+                               autofilled_cells_a=autofilled_cells_a,
+                               autofilled_cells_b=autofilled_cells_b)
     extra_in_a = data_result["extra_in_a"]
     extra_in_b = data_result["extra_in_b"]
     print(f"Distinct row-combinations with EXTRA occurrences in A: {len(extra_in_a)}")
@@ -806,6 +1496,9 @@ def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison
         unmatched_a.to_excel(writer, sheet_name="UnmatchedInA", index=False)
         unmatched_b.to_excel(writer, sheet_name="UnmatchedInB", index=False)
 
+    # ---- HIGHLIGHT THE IDENTIFIED DIFFERENCES (cosmetic post-processing) ----
+    highlight_result_workbook(output_path, _autofill_display_info(extra_in_a, extra_in_b, match_result))
+
     print("Done.")
 
 
@@ -826,15 +1519,11 @@ from pathlib import Path
 from datetime import datetime
 
 # ---- EDIT THESE FOLDER PATHS ONCE, THEN NEVER TOUCH THEM AGAIN ----
-BASE_FOLDER = Path(__file__).resolve().parent
- 
-TABLEAU_FOLDER = BASE_FOLDER / "NeedToTestTBL"
-POWERBI_FOLDER = BASE_FOLDER / "NeedToTestPBI"
- 
-ARCHIVE_TABLEAU_FOLDER = BASE_FOLDER / "Tableau_Archive"
-ARCHIVE_POWERBI_FOLDER = BASE_FOLDER / "Powerbi_Archive"
- 
-RESULT_FOLDER = BASE_FOLDER / "Comparision_Tbl_PBI"
+TABLEAU_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\NeedToTestTBL")
+POWERBI_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\NeedToTestPBI")
+ARCHIVE_TABLEAU_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Tableau_Archive")
+ARCHIVE_POWERBI_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Powerbi_Archive")
+RESULT_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Comparision_Tbl_PBI")
  
 # File extensions to look for when auto-discovering the file in each folder.
 VALID_EXTENSIONS = (".xlsx", ".xls", ".csv")
@@ -868,26 +1557,60 @@ def _find_single_file(folder):
     return candidates[0]
 
 
-def _load_any(path, sheet_name=0):
+def _load_any(path, sheet_name=0, expand_powerbi_merges=False):
     """Reads .xlsx/.xls via load_sheet(), or .csv directly, based on extension."""
     path = Path(path)
     if path.suffix.lower() == ".csv":
         return pd.read_csv(path, dtype=object)
-    return load_sheet(path, sheet_name)
+    return load_sheet(path, sheet_name, expand_powerbi_merges=expand_powerbi_merges)
+
+
+def _preprocess_and_save(path, sheet_index, sheet_label, interactive_autofill,
+                         expand_powerbi_merges=True):
+    """
+    Loads a source file, applies (in order) user-selected autofill,
+    configured merged-cell forward-fill, and date-column conversion to
+    MM-DD-YYYY, then writes the result BACK to the same source file on
+    disk so the modifications are preserved before archiving.
+
+    Returns the modified in-memory dataframe (already reflecting exactly
+    what was written to disk) so the caller doesn't need to re-read the
+    file.
+    """
+    df = _load_any(path, sheet_index, expand_powerbi_merges=expand_powerbi_merges)
+    autofilled_cells = set()
+    if interactive_autofill:
+        df, autofilled_cells = prompt_for_autofill(df, sheet_label)
+    if FORWARD_FILL_COLUMNS:
+        print(f"Forward-filling merged-cell columns in {sheet_label}: {FORWARD_FILL_COLUMNS}")
+        df, configured_cells = forward_fill_merged_cells(df, FORWARD_FILL_COLUMNS)
+        autofilled_cells.update(configured_cells)
+    df = convert_date_columns_to_mmddyyyy(df)
+    save_dataframe_to_source(df, path, sheet_index)
+    return df, autofilled_cells
 
 
 def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
-                           max_differing_columns=MAX_DIFFERING_COLUMNS_FOR_MATCH):
+                           max_differing_columns=MAX_DIFFERING_COLUMNS_FOR_MATCH,
+                           interactive_autofill=True):
     """
     Full folder-based workflow:
       1. Auto-find the one file in TABLEAU_FOLDER (Sheet A) and POWERBI_FOLDER (Sheet B).
-      2. Run the full comparison (schema, row counts, data, likely-edited pairing).
-      3. Write results to RESULT_FOLDER as:
+      2. For each file: load -> autofill -> merged-cell fill -> convert date
+         columns to MM-DD-YYYY -> SAVE the modified data back to that same
+         source file on disk (so the file itself now reflects every change
+         made during preprocessing).
+      3. Run the full comparison (schema, row counts, data, likely-edited
+         pairing) using the modified data.
+      4. Write results to RESULT_FOLDER as:
              <TableauFileName>_<YYYYMMDD>_<HHMMSS>.xlsx
-      4. Move the source files into their Archive folders as:
+         and then highlight every identified difference in that workbook.
+      5. Move the (now-modified) source files into their Archive folders as:
              <filename>_TBL_<YYYYMMDD>.xlsx   (from Tableau folder)
              <filename>_PBI_<YYYYMMDD>.xlsx   (from Powerbi folder)
-         so the source folders are empty again and ready for the next run.
+         so the source folders are empty again and ready for the next run,
+         and the archive contains the actual processed input, not the
+         untouched original.
     """
     RESULT_FOLDER.mkdir(parents=True, exist_ok=True)
     ARCHIVE_TABLEAU_FOLDER.mkdir(parents=True, exist_ok=True)
@@ -916,15 +1639,32 @@ def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
     date_str = now.strftime("%Y%m%d")
     time_str = now.strftime("%H%M%S")
 
-    # ---- 2. Load + run the existing comparison pipeline ----
-    df_a = _load_any(path_a, sheet_a_index)
-    df_b = _load_any(path_b, sheet_b_index)
-    if FORWARD_FILL_COLUMNS:
-        print(f"Forward-filling merged-cell columns: {FORWARD_FILL_COLUMNS}")
-        df_a = forward_fill_merged_cells(df_a, FORWARD_FILL_COLUMNS)
-        df_b = forward_fill_merged_cells(df_b, FORWARD_FILL_COLUMNS)
+    # ---- 2. Per-file preprocessing, with the modified data written back to
+    # the source file BEFORE comparison/archiving (Sheet A fully processed
+    # and saved, then Sheet B fully processed and saved) ----
+    print("\n" + "=" * 70)
+    print("PREPROCESSING SHEET A (autofill -> date conversion -> save to source file)")
+    print("=" * 70)
+    df_a, autofilled_cells_a = _preprocess_and_save(
+        path_a, sheet_a_index, "SheetA", interactive_autofill,
+        expand_powerbi_merges=True,
+    )
+
+    print("\n" + "=" * 70)
+    print("PREPROCESSING SHEET B (autofill -> date conversion -> save to source file)")
+    print("=" * 70)
+    df_b, autofilled_cells_b = _preprocess_and_save(
+        path_b, sheet_b_index, "SheetB", interactive_autofill,
+        expand_powerbi_merges=True,
+    )
 
     schema = compare_schema(df_a, df_b)
+    df_b_comparison = align_common_headers(df_b, schema)
+    b_to_result_header = dict(zip(schema["common_b"], schema["common"]))
+    autofilled_cells_b = {
+        (b_to_result_header.get(column, column), row)
+        for column, row in autofilled_cells_b
+    }
     row_counts = compare_row_counts(df_a, df_b)
 
     print("\n" + "=" * 70)
@@ -946,7 +1686,9 @@ def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
     print("\n" + "=" * 70)
     print("DATA COMPARISON")
     print("=" * 70)
-    data_result = compare_data(df_a, df_b, schema["common"])
+    data_result = compare_data(df_a, df_b_comparison, schema["common"],
+                               autofilled_cells_a=autofilled_cells_a,
+                               autofilled_cells_b=autofilled_cells_b)
     extra_in_a = data_result["extra_in_a"]
     extra_in_b = data_result["extra_in_b"]
     print(f"Extra in A: {len(extra_in_a)}   Extra in B: {len(extra_in_b)}")
@@ -993,9 +1735,12 @@ def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
         unmatched_a.to_excel(writer, sheet_name="UnmatchedInA", index=False)
         unmatched_b.to_excel(writer, sheet_name="UnmatchedInB", index=False)
 
+    # ---- HIGHLIGHT THE IDENTIFIED DIFFERENCES (cosmetic post-processing) ----
+    highlight_result_workbook(output_path, _autofill_display_info(extra_in_a, extra_in_b, match_result))
+
     print(f"\nResult written to: {output_path}")
 
-    # ---- 4. Archive the source files ----
+    # ---- 4. Archive the (already-modified-on-disk) source files ----
     archived_a = ARCHIVE_TABLEAU_FOLDER / f"{path_a.stem}_TBL_{date_str}{path_a.suffix}"
     archived_b = ARCHIVE_POWERBI_FOLDER / f"{path_b.stem}_PBI_{date_str}{path_b.suffix}"
 
@@ -1008,8 +1753,8 @@ def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
 
     shutil.move(str(path_a), str(archived_a))
     shutil.move(str(path_b), str(archived_b))
-    print(f"Archived Tableau file -> {archived_a}")
-    print(f"Archived Powerbi file -> {archived_b}")
+    print(f"Archived Tableau file (modified) -> {archived_a}")
+    print(f"Archived Powerbi file (modified) -> {archived_b}")
     print("\nDone. Source folders are now empty and ready for the next run.")
 
 
