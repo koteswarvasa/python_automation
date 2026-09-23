@@ -1,58 +1,4 @@
-"""
-compare_excel_sheets.py
 
-Compares two Excel sheets that represent "the same" dataset but may differ in
-schema, column order, and data, with NO reliable primary key.
-
-CORE APPROACH (read this first)
---------------------------------
-Because there is no key column, row-by-row or index-based comparison is
-meaningless (row 5 in A has no guaranteed relationship to row 5 in B).
-Instead we do a MULTISET / "bag" comparison, conceptually identical to:
-
-    SELECT col1, col2, ..., COUNT(*) AS cnt
-    FROM SheetA
-    GROUP BY col1, col2, ...
-
-    SELECT col1, col2, ..., COUNT(*) AS cnt
-    FROM SheetB
-    GROUP BY col1, col2, ...
-
-We then treat each row as a tuple of values over the columns common to both
-sheets, count how many times each exact tuple occurs in A and in B, and
-compare the counts:
-    - If CountInA > CountInB for a tuple: (CountInA - CountInB) copies of
-      that row are "extra" in A (EXTRA_IN_A).
-    - If CountInB > CountInA: the reverse (EXTRA_IN_B).
-    - If CountInA == CountInB: those rows are considered fully matched and
-      are not reported at all, no matter how many duplicates exist.
-
-This correctly handles duplicates: 3 copies in A vs 1 copy in B reports
-exactly 2 as extra in A, rather than treating any single copy match as
-"fully matched" (which naive drop_duplicates() or set-difference approaches
-would incorrectly do).
-
-Implementation: pandas groupby(...).size() on the common columns gives us
-the per-sheet counts. We then outer-join (merge) the two count tables on the
-tuple of common-column values, fill missing counts with 0, and compute the
-difference.
-
-WHY A SENTINEL FOR NaN
------------------------
-pandas groupby by default drops rows containing NaN in the grouping keys
-(NaN != NaN, so groupby can't form a group for them), unless dropna=False is
-used. Even with dropna=False, NaN-vs-NaN grouping can behave inconsistently
-across pandas versions, and mixing NaN/None/"" invisibly is exactly the kind
-of silent bug this script is meant to catch. So instead we explicitly and
-visibly replace missing values with a distinct sentinel string before
-grouping, so that:
-    - NaN/None (missing) values group together with other missing values
-      in the SAME column (consistent with "missing == missing" semantics
-      for the purposes of row-identity comparison)
-    - Missing values are NEVER confused with an empty string "" or the
-      literal text "None"/"NaN" typed by a user
-This is done per-column so it doesn't collide with real data.
-"""
 
 import pandas as pd
 import numpy as np
@@ -67,6 +13,7 @@ import numpy as np
 # are preserved as real differences, matching the same "be exact" philosophy
 # requested for column names.
 STRIP_WHITESPACE_IN_DATA_VALUES = False
+
 
 # Sentinel used internally to represent "missing" (NaN/None/NaT) so that
 # groupby treats all missing values in a column as equal to each other,
@@ -727,16 +674,19 @@ def find_likely_edited_pairs(extra_in_a, extra_in_b, common_columns,
 
     # Strip the internal __norm__ helper columns before returning -- they
     # were only needed for diff detection above, not for display.
-    display_cols = [c for c in pool_a.columns if not c.startswith("__norm__")]
+    # display_cols must be computed PER SIDE, not shared -- pool_a and
+    # pool_b can have different columns whenever Sheet A/B schemas differ
+    # (e.g. extra columns added to only one sheet).
+    display_cols_a = [c for c in pool_a.columns if not c.startswith("__norm__")]
+    display_cols_b = [c for c in pool_b.columns if not c.startswith("__norm__")]
     unmatched_a_df = (
-        pool_a.loc[unmatched_a_idx, display_cols].reset_index(drop=True)
-        if unmatched_a_idx else pool_a.loc[:, display_cols].iloc[0:0]
+        pool_a.loc[unmatched_a_idx, display_cols_a].reset_index(drop=True)
+        if unmatched_a_idx else pool_a.loc[:, display_cols_a].iloc[0:0]
     )
     unmatched_b_df = (
-        pool_b.loc[list(unmatched_b_idx), display_cols].reset_index(drop=True)
-        if unmatched_b_idx else pool_b.loc[:, display_cols].iloc[0:0]
+        pool_b.loc[list(unmatched_b_idx), display_cols_b].reset_index(drop=True)
+        if unmatched_b_idx else pool_b.loc[:, display_cols_b].iloc[0:0]
     )
-
     return {
         "pairs": pairs_df,             # long format: one row per differing field
         "pairs_full": pairs_full_df,   # wide format: full A + B record per pair
@@ -876,12 +826,16 @@ from pathlib import Path
 from datetime import datetime
 
 # ---- EDIT THESE FOLDER PATHS ONCE, THEN NEVER TOUCH THEM AGAIN ----
-TABLEAU_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\NeedToTestTBL")
-POWERBI_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\NeedToTestPBI")
-ARCHIVE_TABLEAU_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Tableau_Archive")
-ARCHIVE_POWERBI_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Powerbi_Archive")
-RESULT_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Comparision_Tbl_PBI")
-
+BASE_FOLDER = Path(__file__).resolve().parent
+ 
+TABLEAU_FOLDER = BASE_FOLDER / "NeedToTestTBL"
+POWERBI_FOLDER = BASE_FOLDER / "NeedToTestPBI"
+ 
+ARCHIVE_TABLEAU_FOLDER = BASE_FOLDER / "Tableau_Archive"
+ARCHIVE_POWERBI_FOLDER = BASE_FOLDER / "Powerbi_Archive"
+ 
+RESULT_FOLDER = BASE_FOLDER / "Comparision_Tbl_PBI"
+ 
 # File extensions to look for when auto-discovering the file in each folder.
 VALID_EXTENSIONS = (".xlsx", ".xls", ".csv")
 
