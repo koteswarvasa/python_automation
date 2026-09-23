@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from io import BytesIO
 
 # ============================================================================
 # CONFIGURATION -- adjust these to control comparison behavior
@@ -115,15 +116,32 @@ def load_sheet(path, sheet_name=0, expand_powerbi_merges=False):
         openpyxl/pandas naturally infers them (dtype normalization happens
         later, explicitly, in compare_data()).
     """
-    if expand_powerbi_merges:
-        # Save the expanded workbook before pandas reads it, so both the
-        # dataframe and the later archive contain every propagated value.
-        expand_powerbi_merged_cells(path, sheet_name)
-
     # engine="openpyxl" reads .xlsx reliably; dtype=object keeps pandas from
     # silently coercing types on read (e.g. turning "007" into 7), so we can
     # inspect and normalize types ourselves in a controlled, visible step.
-    df = pd.read_excel(path, sheet_name=sheet_name, engine="openpyxl", dtype=object)
+    if expand_powerbi_merges:
+        # Expand a *copy in memory*.  The comparison representation needs
+        # every member of an Excel merged range to have its logical value,
+        # but the original workbook must remain available for report display
+        # and must not be changed merely by loading it.
+        import openpyxl
+
+        wb = openpyxl.load_workbook(path)
+        ws = wb.worksheets[sheet_name] if isinstance(sheet_name, int) else wb[sheet_name]
+        for merged_range in list(ws.merged_cells.ranges):
+            min_col, min_row, max_col, max_row = merged_range.bounds
+            value = ws.cell(row=min_row, column=min_col).value
+            ws.unmerge_cells(str(merged_range))
+            for row in ws.iter_rows(min_row=min_row, max_row=max_row,
+                                    min_col=min_col, max_col=max_col):
+                for cell in row:
+                    cell.value = value
+        buffer = BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+        df = pd.read_excel(buffer, sheet_name=sheet_name, engine="openpyxl", dtype=object)
+    else:
+        df = pd.read_excel(path, sheet_name=sheet_name, engine="openpyxl", dtype=object)
 
     # pandas.read_excel does NOT strip header whitespace by default, but we
     # assert/document that explicitly here so future pandas versions or
@@ -344,6 +362,13 @@ def save_dataframe_to_source(df, path, sheet_name=0):
         ws = wb.worksheets[sheet_name]
     else:
         ws = wb[sheet_name]
+
+    # A source sheet may still contain merged ranges because comparison-time
+    # expansion is deliberately in-memory.  Remove those definitions before
+    # replacing its rows; otherwise openpyxl retains stale merged-cell
+    # objects that conflict with the rewritten flat table.
+    for merged_range in list(ws.merged_cells.ranges):
+        ws.unmerge_cells(str(merged_range))
 
     # Clear existing rows on the target sheet only, then rewrite header +
     # data from the (possibly modified) dataframe. Other sheets in the
@@ -641,7 +666,8 @@ def normalize_dataframe(df, columns, apply_numeric_normalization=True,
 # ============================================================================
 
 def compare_data(df_a, df_b, common_columns, tableau_previous_value_fill=True,
-                 autofilled_cells_a=None, autofilled_cells_b=None):
+                 autofilled_cells_a=None, autofilled_cells_b=None,
+                 display_df_a=None, display_df_b=None):
     """
     Multiset comparison of df_a and df_b restricted to `common_columns`.
 
@@ -669,9 +695,15 @@ def compare_data(df_a, df_b, common_columns, tableau_previous_value_fill=True,
         'extra_in_b' : same, reversed.
     """
     # --- normalize both sides identically before grouping ---
+    # A report-style export can use a blank cell to mean "same as the row
+    # above".  This must be applied to BOTH sources: doing it only for the
+    # Tableau side makes two equivalent physical representations compare as
+    # different row tuples.  The legacy argument is retained for callers
+    # that explicitly need to disable this comparison-time behavior.
     norm_a = normalize_dataframe(df_a, common_columns,
                                  apply_previous_value_fill=tableau_previous_value_fill)
-    norm_b = normalize_dataframe(df_b, common_columns)
+    norm_b = normalize_dataframe(df_b, common_columns,
+                                 apply_previous_value_fill=tableau_previous_value_fill)
 
     # --- STEP: group by the full row-tuple and count occurrences ---
     # groupby(...).size() is the pandas equivalent of GROUP BY + COUNT(*).
@@ -715,10 +747,12 @@ def compare_data(df_a, df_b, common_columns, tableau_previous_value_fill=True,
     # this by taking one representative original row per matched normalized
     # tuple from the sheet that has extra copies.
     extra_in_a = _attach_original_values(
-        extra_in_a, df_a, common_columns, norm_a, autofilled_cells_a
+        extra_in_a, display_df_a if display_df_a is not None else df_a,
+        common_columns, norm_a, autofilled_cells_a
     )
     extra_in_b = _attach_original_values(
-        extra_in_b, df_b, common_columns, norm_b, autofilled_cells_b
+        extra_in_b, display_df_b if display_df_b is not None else df_b,
+        common_columns, norm_b, autofilled_cells_b
     )
 
     return {"extra_in_a": extra_in_a, "extra_in_b": extra_in_b}
@@ -1362,243 +1396,6 @@ def _autofill_display_info(extra_in_a, extra_in_b, match_result):
 
 
 # ============================================================================
-# RESULT HIGHLIGHTING (NEW -- runs AFTER the result workbook is written)
-# ============================================================================
-# Everything below is pure output formatting. It re-opens the finished
-# result .xlsx with openpyxl and paints a light background fill on the cells
-# that represent the differences ALREADY identified by the comparison above.
-# No comparison logic is re-run, no values are recalculated, and no data is
-# added, removed, or reordered -- only cell fill colors are set. If anything
-# in here fails for any reason, the failure is caught and reported, and the
-# (already complete and correct) workbook is simply left unhighlighted.
-#
-# Colour key, applied consistently across every sheet:
-#   light amber (HIGHLIGHT_CHANGED_VALUE_COLOR) -> a value that DIFFERS
-#   light red   (HIGHLIGHT_EXTRA_IN_A_COLOR)    -> present/excess in A only
-#   light blue  (HIGHLIGHT_EXTRA_IN_B_COLOR)    -> present/excess in B only
-
-def _solid_fill(hex_color):
-    """Build a solid openpyxl PatternFill from a 6-digit RRGGBB hex string."""
-    from openpyxl.styles import PatternFill
-    return PatternFill(start_color=hex_color, end_color=hex_color, fill_type="solid")
-
-
-def _header_index_map(ws):
-    """
-    Map {header text -> 1-based column index} by reading row 1 of a
-    worksheet. Reading the headers back off the sheet (rather than assuming
-    a fixed column order) keeps this robust if the column layout of any
-    result sheet ever changes.
-    """
-    headers = {}
-    for cell in ws[1]:
-        if cell.value is not None:
-            headers[str(cell.value)] = cell.column
-    return headers
-
-
-def _highlight_entire_data_rows(ws, fill):
-    """Fill every populated data cell (row 2 downward) on a worksheet."""
-    if ws.max_row is None or ws.max_row < 2:
-        return 0
-    filled_rows = 0
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row,
-                            min_col=1, max_col=ws.max_column):
-        for cell in row:
-            cell.fill = fill
-        filled_rows += 1
-    return filled_rows
-
-
-def _highlight_column_by_name(ws, header_name, fill):
-    """Fill every data cell under one named column, if that column exists."""
-    headers = _header_index_map(ws)
-    col_idx = headers.get(header_name)
-    if not col_idx or ws.max_row is None or ws.max_row < 2:
-        return 0
-    count = 0
-    for row_idx in range(2, ws.max_row + 1):
-        ws.cell(row=row_idx, column=col_idx).fill = fill
-        count += 1
-    return count
-
-
-def _highlight_mismatched_records(ws, fill):
-    """
-    MismatchedRecords (wide format): for each matched pair, read that row's
-    'DifferingColumns' value and highlight ONLY the '<col> [A]' and
-    '<col> [B]' cells for the columns actually named there. Columns that
-    matched between the two sheets stay unhighlighted, so what changed
-    jumps out immediately even on a very wide record.
-    """
-    headers = _header_index_map(ws)
-    diff_idx = headers.get("DifferingColumns")
-    if not diff_idx or ws.max_row is None or ws.max_row < 2:
-        return 0
-
-    highlighted = 0
-    for row_idx in range(2, ws.max_row + 1):
-        raw = ws.cell(row=row_idx, column=diff_idx).value
-        if raw in (None, "", "(identical)"):
-            continue
-        for name in [part.strip() for part in str(raw).split(",") if part.strip()]:
-            for suffix in ("[A]", "[B]"):
-                col_idx = headers.get(f"{name} {suffix}")
-                if col_idx:
-                    ws.cell(row=row_idx, column=col_idx).fill = fill
-                    highlighted += 1
-        # Also tint the DifferingColumns cell itself so the row is easy to
-        # spot when scrolling horizontally through a wide pair record.
-        ws.cell(row=row_idx, column=diff_idx).fill = fill
-    return highlighted
-
-
-def _highlight_mismatched_records_short(ws, fill_a, fill_b, fill_changed):
-    """
-    MismatchedRecordsShort (long format): every row here IS a difference,
-    so highlight the Column name (amber), the A value (light red) and the
-    B value (light blue) -- side-by-side colours make it obvious at a glance
-    which sheet each value came from.
-    """
-    headers = _header_index_map(ws)
-    if ws.max_row is None or ws.max_row < 2:
-        return 0
-    targets = [
-        ("Column", fill_changed),
-        ("ValueInA", fill_a),
-        ("ValueInB", fill_b),
-    ]
-    count = 0
-    for row_idx in range(2, ws.max_row + 1):
-        for header_name, fill in targets:
-            col_idx = headers.get(header_name)
-            if col_idx:
-                ws.cell(row=row_idx, column=col_idx).fill = fill
-                count += 1
-    return count
-
-
-def _highlight_summary(ws, fill):
-    """
-    Summary: highlight the Value cell of any metric that represents a
-    detected difference and is NON-ZERO. Metrics that are simply
-    descriptive (file names, total column/row counts) and differences that
-    came out as zero are deliberately left plain, so the highlighted cells
-    are exactly the ones worth investigating.
-    """
-    headers = _header_index_map(ws)
-    metric_idx = headers.get("Metric")
-    value_idx = headers.get("Value")
-    if not metric_idx or not value_idx or ws.max_row is None or ws.max_row < 2:
-        return 0
-
-    difference_metrics = {
-        "Columns only in A",
-        "Columns only in B",
-        "Row count difference (A-B)",
-        "Distinct row-combos extra in A",
-        "Distinct row-combos extra in B",
-        "Likely-edited pairs found",
-        "Still-unmatched extra rows in A",
-        "Still-unmatched extra rows in B",
-    }
-
-    count = 0
-    for row_idx in range(2, ws.max_row + 1):
-        metric = ws.cell(row=row_idx, column=metric_idx).value
-        if metric not in difference_metrics:
-            continue
-        value = ws.cell(row=row_idx, column=value_idx).value
-        try:
-            is_nonzero = float(value) != 0
-        except (TypeError, ValueError):
-            is_nonzero = False
-        if is_nonzero:
-            ws.cell(row=row_idx, column=metric_idx).fill = fill
-            ws.cell(row=row_idx, column=value_idx).fill = fill
-            count += 1
-    return count
-
-
-def highlight_result_workbook(output_path):
-    """
-    Post-process the generated result workbook at `output_path`, applying a
-    light background fill to every cell that represents an identified
-    difference. Called at the very end of run_comparison() and
-    run_folder_comparison(), immediately after the workbook is written.
-
-    Sheet-by-sheet behaviour:
-      Summary                -> non-zero difference metrics (amber)
-      MissingInB             -> each column name found only in A (light red)
-      MissingInA             -> each column name found only in B (light blue)
-      ExtraInA               -> whole row (light red)
-      ExtraInB               -> whole row (light blue)
-      MismatchedRecords      -> only the '[A]'/'[B]' cells whose column is
-                                listed in that row's DifferingColumns (amber)
-      MismatchedRecordsShort -> Column (amber), ValueInA (red), ValueInB (blue)
-      UnmatchedInA           -> whole row (light red)
-      UnmatchedInB           -> whole row (light blue)
-
-    Purely cosmetic and fully optional: set HIGHLIGHT_RESULTS = False at the
-    top of the file to skip it, and any unexpected error here is caught and
-    printed without disturbing the workbook that was already written.
-    """
-    if not HIGHLIGHT_RESULTS:
-        return
-
-    try:
-        import openpyxl
-
-        fill_changed = _solid_fill(HIGHLIGHT_CHANGED_VALUE_COLOR)
-        fill_a = _solid_fill(HIGHLIGHT_EXTRA_IN_A_COLOR)
-        fill_b = _solid_fill(HIGHLIGHT_EXTRA_IN_B_COLOR)
-        fill_summary = _solid_fill(HIGHLIGHT_SUMMARY_COLOR)
-
-        wb = openpyxl.load_workbook(output_path)
-
-        if "Summary" in wb.sheetnames:
-            _highlight_summary(wb["Summary"], fill_summary)
-
-        # Schema differences: the single column of names on each sheet IS
-        # the difference, so the whole column gets tinted.
-        if "MissingInB" in wb.sheetnames:
-            _highlight_column_by_name(wb["MissingInB"], "ColumnOnlyInA", fill_a)
-        if "MissingInA" in wb.sheetnames:
-            _highlight_column_by_name(wb["MissingInA"], "ColumnOnlyInB", fill_b)
-
-        # Extra / unmatched rows: the ENTIRE row is the finding (this whole
-        # record is excess on one side), so the full row is tinted rather
-        # than any individual cell.
-        for sheet_name, fill in (
-            ("ExtraInA", fill_a),
-            ("ExtraInB", fill_b),
-            ("UnmatchedInA", fill_a),
-            ("UnmatchedInB", fill_b),
-        ):
-            if sheet_name in wb.sheetnames:
-                _highlight_entire_data_rows(wb[sheet_name], fill)
-
-        # Likely-edited pairs: only the fields that actually changed.
-        if "MismatchedRecords" in wb.sheetnames:
-            _highlight_mismatched_records(wb["MismatchedRecords"], fill_changed)
-        if "MismatchedRecordsShort" in wb.sheetnames:
-            _highlight_mismatched_records_short(
-                wb["MismatchedRecordsShort"], fill_a, fill_b, fill_changed
-            )
-
-        wb.save(output_path)
-        print(
-            "Highlighting applied to result workbook "
-            f"(changed={HIGHLIGHT_CHANGED_VALUE_COLOR}, "
-            f"extra-in-A={HIGHLIGHT_EXTRA_IN_A_COLOR}, "
-            f"extra-in-B={HIGHLIGHT_EXTRA_IN_B_COLOR})."
-        )
-    except Exception as exc:  # never let cosmetics break a finished report
-        print(f"[WARNING] Could not apply highlighting to {output_path}: {exc}")
-        print("The result workbook itself was written successfully and is complete.")
-
-
-# ============================================================================
 # ORCHESTRATION
 # ============================================================================
 
@@ -1614,6 +1411,11 @@ def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison
     print("=" * 70)
     # Merged ranges are a property of the actual source worksheet, not its
     # SheetA/SheetB role. Expand them before reading either input.
+    # Keep untouched display copies separate from the working comparison
+    # copies.  The latter expand merged cells; the former are used only when
+    # writing human-readable difference rows.
+    display_df_a = load_sheet(path_a, sheet_a)
+    display_df_b = load_sheet(path_b, sheet_b)
     df_a = load_sheet(path_a, sheet_a, expand_powerbi_merges=True)
     df_b = load_sheet(path_b, sheet_b, expand_powerbi_merges=True)
     autofilled_cells_a = set()
@@ -1641,6 +1443,7 @@ def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison
     print("=" * 70)
     schema = compare_schema(df_a, df_b)
     df_b_comparison = align_common_headers(df_b, schema)
+    display_df_b = align_common_headers(display_df_b, schema)
     # Result sheets use Sheet A's display names for whitespace-equivalent
     # common headers, so translate only the in-memory tracking labels too.
     b_to_result_header = dict(zip(schema["common_b"], schema["common"]))
@@ -1675,7 +1478,9 @@ def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison
     print(f"STRIP_WHITESPACE_IN_DATA_VALUES = {STRIP_WHITESPACE_IN_DATA_VALUES}")
     data_result = compare_data(df_a, df_b_comparison, schema["common"],
                                autofilled_cells_a=autofilled_cells_a,
-                               autofilled_cells_b=autofilled_cells_b)
+                               autofilled_cells_b=autofilled_cells_b,
+                               display_df_a=display_df_a,
+                               display_df_b=display_df_b)
     extra_in_a = data_result["extra_in_a"]
     extra_in_b = data_result["extra_in_b"]
     print(f"Distinct row-combinations with EXTRA occurrences in A: {len(extra_in_a)}")
@@ -1872,6 +1677,13 @@ def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
     print(f"Found Tableau file (Sheet A): {path_a}")
     print(f"Found Powerbi file (Sheet B): {path_b}")
 
+    # Preserve the source representation for result-sheet display.  Working
+    # copies below may expand merges, forward-fill report blanks, and convert
+    # dates before grouping, but those transformations must not replace the
+    # values a reviewer sees in ExtraInA/ExtraInB and mismatch reports.
+    display_df_a = _load_any(path_a, sheet_a_index)
+    display_df_b = _load_any(path_b, sheet_b_index)
+
     now = datetime.now()
     date_str = now.strftime("%Y%m%d")
     time_str = now.strftime("%H%M%S")
@@ -1897,6 +1709,7 @@ def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
 
     schema = compare_schema(df_a, df_b)
     df_b_comparison = align_common_headers(df_b, schema)
+    display_df_b = align_common_headers(display_df_b, schema)
     b_to_result_header = dict(zip(schema["common_b"], schema["common"]))
     autofilled_cells_b = {
         (b_to_result_header.get(column, column), row)
@@ -1925,7 +1738,9 @@ def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
     print("=" * 70)
     data_result = compare_data(df_a, df_b_comparison, schema["common"],
                                autofilled_cells_a=autofilled_cells_a,
-                               autofilled_cells_b=autofilled_cells_b)
+                               autofilled_cells_b=autofilled_cells_b,
+                               display_df_a=display_df_a,
+                               display_df_b=display_df_b)
     extra_in_a = data_result["extra_in_a"]
     extra_in_b = data_result["extra_in_b"]
     print(f"Extra in A: {len(extra_in_a)}   Extra in B: {len(extra_in_b)}")
