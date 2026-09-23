@@ -12,7 +12,10 @@ import numpy as np
 # the SAME value. If False (default), whitespace differences in data values
 # are preserved as real differences, matching the same "be exact" philosophy
 # requested for column names.
-STRIP_WHITESPACE_IN_DATA_VALUES = False
+# Comparison is deliberately insensitive to incidental outer whitespace; it
+# does not alter internal whitespace ("New York" remains different from
+# "NewYork").
+STRIP_WHITESPACE_IN_DATA_VALUES = True
 
 
 # Sentinel used internally to represent "missing" (NaN/None/NaT) so that
@@ -95,8 +98,42 @@ def forward_fill_merged_cells(df, columns):
     df = df.copy()
     for col in columns:
         if col in df.columns:
-            df[col] = df[col].ffill()
+            # ffill only recognizes NaN, while exports often represent blank
+            # merged cells as empty/whitespace strings.  Convert those to
+            # missing first.  pandas leaves leading missing values missing,
+            # which is the required first-row behavior.
+            values = df[col].copy()
+            blank = values.isna() | values.map(lambda v: isinstance(v, str) and not v.strip())
+            df[col] = values.mask(blank).ffill()
     return df
+
+
+def prompt_for_autofill(df, sheet_label):
+    """Interactively forward-fill only columns explicitly selected by user."""
+    while True:
+        print(f"\nDo you want to autofill any columns in {sheet_label}?")
+        print("1. Yes\n2. No")
+        choice = input("Select 1 or 2: ").strip()
+        if choice == "2":
+            return df
+        if choice == "1":
+            break
+        print("Please enter 1 (Yes) or 2 (No).")
+
+    columns = list(df.columns)
+    print(f"Available {sheet_label} columns:")
+    for number, column in enumerate(columns, start=1):
+        print(f"  {number}. {column}")
+    while True:
+        selected = input("Select one or more column numbers (comma-separated): ").strip()
+        try:
+            indices = [int(item.strip()) for item in selected.split(",") if item.strip()]
+            if not indices or any(index < 1 or index > len(columns) for index in indices):
+                raise ValueError
+            selected_columns = list(dict.fromkeys(columns[index - 1] for index in indices))
+            return forward_fill_merged_cells(df, selected_columns)
+        except ValueError:
+            print("Enter one or more valid column numbers, separated by commas.")
 
 
 # ============================================================================
@@ -105,8 +142,8 @@ def forward_fill_merged_cells(df, columns):
 
 def compare_schema(df_a, df_b):
     """
-    Compare column headers between two sheets using EXACT string matching
-    (case-sensitive, whitespace-sensitive -- no trimming or normalizing).
+    Compare headers after trimming only leading/trailing whitespace.  The
+    returned common names preserve Sheet A's original display names.
 
     Returns
     -------
@@ -122,20 +159,37 @@ def compare_schema(df_a, df_b):
     cols_a = list(df_a.columns)
     cols_b = list(df_b.columns)
 
-    set_a = set(cols_a)
-    set_b = set(cols_b)
-
-    only_in_a = [c for c in cols_a if c not in set_b]
-    only_in_b = [c for c in cols_b if c not in set_a]
-    common = [c for c in cols_a if c in set_b]  # order: as they appear in A
+    normalize_header = lambda c: c.strip() if isinstance(c, str) else c
+    normalized_a = [normalize_header(c) for c in cols_a]
+    normalized_b = [normalize_header(c) for c in cols_b]
+    # Ambiguous headers cannot be safely matched after trimming.
+    if len(set(normalized_a)) != len(normalized_a) or len(set(normalized_b)) != len(normalized_b):
+        raise ValueError("A sheet has duplicate column names after trimming leading/trailing whitespace.")
+    set_a, set_b = set(normalized_a), set(normalized_b)
+    only_in_a = [c for c, normalized in zip(cols_a, normalized_a) if normalized not in set_b]
+    only_in_b = [c for c, normalized in zip(cols_b, normalized_b) if normalized not in set_a]
+    common = [c for c, normalized in zip(cols_a, normalized_a) if normalized in set_b]
+    b_name_by_normalized = dict(zip(normalized_b, cols_b))
+    common_b = [b_name_by_normalized[normalize_header(c)] for c in common]
 
     return {
         "only_in_a": only_in_a,
         "only_in_b": only_in_b,
         "common": common,
+        "common_b": common_b,
         "count_a": len(cols_a),
         "count_b": len(cols_b),
     }
+
+
+def align_common_headers(df_b, schema):
+    """Give B's whitespace-equivalent common headers A's display names.
+
+    This alignment is confined to the in-memory comparison dataframe. Source
+    headers remain untouched when files are loaded and archived.
+    """
+    rename_map = dict(zip(schema["common_b"], schema["common"]))
+    return df_b.rename(columns=rename_map)
 
 
 # ============================================================================
@@ -204,6 +258,22 @@ def _normalize_time_value(v):
         if len(parts) == 2:
             s = s + ":00"
         return s
+    return v
+
+
+def _normalize_date_value(v):
+    """Return YYYY-MM-DD for real datetimes and ISO-style datetime text."""
+    import datetime
+    import re
+
+    if isinstance(v, (pd.Timestamp, datetime.datetime, datetime.date, np.datetime64)):
+        parsed = pd.to_datetime(v, errors="coerce")
+        return parsed.strftime("%Y-%m-%d") if not pd.isna(parsed) else v
+    # Restrict text parsing to unambiguous ISO dates, so ordinary identifiers
+    # and free text are never accidentally converted to dates.
+    if isinstance(v, str) and re.match(r"^\s*\d{4}-\d{1,2}-\d{1,2}(?:[ T].*)?\s*$", v):
+        parsed = pd.to_datetime(v.strip(), errors="coerce")
+        return parsed.strftime("%Y-%m-%d") if not pd.isna(parsed) else v
     return v
 
 
@@ -280,7 +350,8 @@ def _normalize_value(v, strip_whitespace):
     return str(v)  # safety net -- see docstring above
 
 
-def normalize_dataframe(df, columns, apply_numeric_normalization=True):
+def normalize_dataframe(df, columns, apply_numeric_normalization=True,
+                        apply_previous_value_fill=False):
     """
     Apply the configured normalization steps to `columns` of `df`, returning
     a NEW dataframe (does not mutate the input). This is the single place
@@ -306,18 +377,18 @@ def normalize_dataframe(df, columns, apply_numeric_normalization=True):
     out = df[columns].copy()
 
     for col in columns:
+        if apply_previous_value_fill:
+            # This is comparison-time Tableau expansion.  It does not alter
+            # the source dataframe or fill a leading blank from a future row.
+            values = out[col]
+            blank = values.isna() | values.map(lambda v: isinstance(v, str) and not v.strip())
+            out[col] = values.mask(blank).ffill()
         is_time_col = col in FORCE_TIME_COLUMNS or _looks_like_time_series(out[col])
 
         def _norm(v, is_time_col=is_time_col):
+            v = _normalize_date_value(v)
             if is_time_col:
                 v = _normalize_time_value(v)
-            # NOTE: date/datetime normalization was removed at the user's
-            # request. Date-like columns are NOT reformatted here -- if one
-            # sheet stores a date as text and the other as a real date
-            # object, they will show up as different. The final str()
-            # safety net in _normalize_value() below still guarantees this
-            # can't crash the comparison (e.g. a pd.merge dtype error) --
-            # it just means date columns compare literally, as-is.
             if apply_numeric_normalization:
                 v = _normalize_numeric_like(v)
             return _normalize_value(v, STRIP_WHITESPACE_IN_DATA_VALUES)
@@ -336,7 +407,7 @@ def normalize_dataframe(df, columns, apply_numeric_normalization=True):
 # STEP 3: DATA COMPARISON (multiset / bag comparison)
 # ============================================================================
 
-def compare_data(df_a, df_b, common_columns):
+def compare_data(df_a, df_b, common_columns, tableau_previous_value_fill=True):
     """
     Multiset comparison of df_a and df_b restricted to `common_columns`.
 
@@ -364,7 +435,8 @@ def compare_data(df_a, df_b, common_columns):
         'extra_in_b' : same, reversed.
     """
     # --- normalize both sides identically before grouping ---
-    norm_a = normalize_dataframe(df_a, common_columns)
+    norm_a = normalize_dataframe(df_a, common_columns,
+                                 apply_previous_value_fill=tableau_previous_value_fill)
     norm_b = normalize_dataframe(df_b, common_columns)
 
     # --- STEP: group by the full row-tuple and count occurrences ---
@@ -700,7 +772,8 @@ def find_likely_edited_pairs(extra_in_a, extra_in_b, common_columns,
 # ORCHESTRATION
 # ============================================================================
 
-def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison_output.xlsx"):
+def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison_output.xlsx",
+                   interactive_autofill=True):
     """
     Runs the full comparison pipeline in order (schema -> row counts ->
     data), prints a console summary, and writes results to an output .xlsx
@@ -711,6 +784,9 @@ def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison
     print("=" * 70)
     df_a = load_sheet(path_a, sheet_a)
     df_b = load_sheet(path_b, sheet_b)
+    if interactive_autofill:
+        df_a = prompt_for_autofill(df_a, "SheetA")
+        df_b = prompt_for_autofill(df_b, "SheetB")
     if FORWARD_FILL_COLUMNS:
         print(f"Forward-filling merged-cell columns: {FORWARD_FILL_COLUMNS}")
         df_a = forward_fill_merged_cells(df_a, FORWARD_FILL_COLUMNS)
@@ -723,6 +799,7 @@ def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison
     print("STEP 1: SCHEMA CHECK")
     print("=" * 70)
     schema = compare_schema(df_a, df_b)
+    df_b_comparison = align_common_headers(df_b, schema)
     print(f"Total columns in A: {schema['count_a']}")
     print(f"Total columns in B: {schema['count_b']}")
     print(f"Columns only in A ({len(schema['only_in_a'])}): {schema['only_in_a']}")
@@ -748,7 +825,7 @@ def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison
     print("=" * 70)
     print(f"Comparing on {len(schema['common'])} common columns.")
     print(f"STRIP_WHITESPACE_IN_DATA_VALUES = {STRIP_WHITESPACE_IN_DATA_VALUES}")
-    data_result = compare_data(df_a, df_b, schema["common"])
+    data_result = compare_data(df_a, df_b_comparison, schema["common"])
     extra_in_a = data_result["extra_in_a"]
     extra_in_b = data_result["extra_in_b"]
     print(f"Distinct row-combinations with EXTRA occurrences in A: {len(extra_in_a)}")
@@ -826,16 +903,16 @@ from pathlib import Path
 from datetime import datetime
 
 # ---- EDIT THESE FOLDER PATHS ONCE, THEN NEVER TOUCH THEM AGAIN ----
-BASE_FOLDER = Path(__file__).resolve().parent
- 
-TABLEAU_FOLDER = BASE_FOLDER / "NeedToTestTBL"
-POWERBI_FOLDER = BASE_FOLDER / "NeedToTestPBI"
- 
-ARCHIVE_TABLEAU_FOLDER = BASE_FOLDER / "Tableau_Archive"
-ARCHIVE_POWERBI_FOLDER = BASE_FOLDER / "Powerbi_Archive"
- 
-RESULT_FOLDER = BASE_FOLDER / "Comparision_Tbl_PBI"
- 
+TABLEAU_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\NeedToTestTBL")
+
+POWERBI_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\NeedToTestPBI")
+
+ARCHIVE_TABLEAU_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Tableau_Archive")
+
+ARCHIVE_POWERBI_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Powerbi_Archive")
+
+RESULT_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Comparision_Tbl_PBI")
+
 # File extensions to look for when auto-discovering the file in each folder.
 VALID_EXTENSIONS = (".xlsx", ".xls", ".csv")
 
@@ -877,7 +954,8 @@ def _load_any(path, sheet_name=0):
 
 
 def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
-                           max_differing_columns=MAX_DIFFERING_COLUMNS_FOR_MATCH):
+                           max_differing_columns=MAX_DIFFERING_COLUMNS_FOR_MATCH,
+                           interactive_autofill=True):
     """
     Full folder-based workflow:
       1. Auto-find the one file in TABLEAU_FOLDER (Sheet A) and POWERBI_FOLDER (Sheet B).
@@ -919,12 +997,16 @@ def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
     # ---- 2. Load + run the existing comparison pipeline ----
     df_a = _load_any(path_a, sheet_a_index)
     df_b = _load_any(path_b, sheet_b_index)
+    if interactive_autofill:
+        df_a = prompt_for_autofill(df_a, "SheetA")
+        df_b = prompt_for_autofill(df_b, "SheetB")
     if FORWARD_FILL_COLUMNS:
         print(f"Forward-filling merged-cell columns: {FORWARD_FILL_COLUMNS}")
         df_a = forward_fill_merged_cells(df_a, FORWARD_FILL_COLUMNS)
         df_b = forward_fill_merged_cells(df_b, FORWARD_FILL_COLUMNS)
 
     schema = compare_schema(df_a, df_b)
+    df_b_comparison = align_common_headers(df_b, schema)
     row_counts = compare_row_counts(df_a, df_b)
 
     print("\n" + "=" * 70)
@@ -946,7 +1028,7 @@ def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
     print("\n" + "=" * 70)
     print("DATA COMPARISON")
     print("=" * 70)
-    data_result = compare_data(df_a, df_b, schema["common"])
+    data_result = compare_data(df_a, df_b_comparison, schema["common"])
     extra_in_a = data_result["extra_in_a"]
     extra_in_b = data_result["extra_in_b"]
     print(f"Extra in A: {len(extra_in_a)}   Extra in B: {len(extra_in_b)}")
