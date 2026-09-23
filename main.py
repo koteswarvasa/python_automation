@@ -1,5 +1,3 @@
-
-
 import pandas as pd
 import numpy as np
 
@@ -31,12 +29,46 @@ _MISSING_SENTINEL = "<<<__MISSING__>>>"
 # can force specific columns here if auto-detection misses them:
 FORCE_TIME_COLUMNS = []  # e.g. ["Start Time", "Doors Closed"]
 
+# Columns whose values are dates/datetimes will be converted to "MM-DD-YYYY"
+# text (time-of-day dropped entirely) before comparison AND before the
+# source file is saved/archived. Detection is automatic (see
+# _looks_like_date_series below), but you can force specific columns here if
+# auto-detection misses them:
+FORCE_DATE_COLUMNS = []  # e.g. ["Flight Date", "Booking Date"]
+
 
 # ============================================================================
 # STEP 0: LOAD
 # ============================================================================
 
-def load_sheet(path, sheet_name=0):
+def expand_powerbi_merged_cells(path, sheet_name=0):
+    """Expand merged cells in one Power BI worksheet and save the workbook.
+
+    Excel stores a value only in the top-left cell of a merged range.  The
+    range is unmerged first because openpyxl's other cells in a merged range
+    are read-only, then that top-left value is written to every former member
+    of the range.  This deliberately affects only ranges Excel explicitly
+    marks as merged; ordinary blank cells are left untouched.
+    """
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path)
+    ws = wb.worksheets[sheet_name] if isinstance(sheet_name, int) else wb[sheet_name]
+
+    # Copy because unmerge_cells changes ws.merged_cells.ranges while iterating.
+    for merged_range in list(ws.merged_cells.ranges):
+        min_col, min_row, max_col, max_row = merged_range.bounds
+        value = ws.cell(row=min_row, column=min_col).value
+        ws.unmerge_cells(str(merged_range))
+        for row in ws.iter_rows(min_row=min_row, max_row=max_row,
+                                min_col=min_col, max_col=max_col):
+            for cell in row:
+                cell.value = value
+
+    wb.save(path)
+
+
+def load_sheet(path, sheet_name=0, expand_powerbi_merges=False):
     """
     Load a single sheet from an .xlsx file, preserving column headers
     EXACTLY as written (no auto-stripping of whitespace), so that a header
@@ -57,6 +89,11 @@ def load_sheet(path, sheet_name=0):
         openpyxl/pandas naturally infers them (dtype normalization happens
         later, explicitly, in compare_data()).
     """
+    if expand_powerbi_merges:
+        # Save the expanded workbook before pandas reads it, so both the
+        # dataframe and the later archive contain every propagated value.
+        expand_powerbi_merged_cells(path, sheet_name)
+
     # engine="openpyxl" reads .xlsx reliably; dtype=object keeps pandas from
     # silently coercing types on read (e.g. turning "007" into 7), so we can
     # inspect and normalize types ourselves in a controlled, visible step.
@@ -134,6 +171,152 @@ def prompt_for_autofill(df, sheet_label):
             return forward_fill_merged_cells(df, selected_columns)
         except ValueError:
             print("Enter one or more valid column numbers, separated by commas.")
+
+
+# ============================================================================
+# DATE COLUMN DETECTION + CONVERSION (MM-DD-YYYY, time dropped entirely)
+# ============================================================================
+# This section is new. It is used both to normalize dates for comparison
+# and -- unlike the pre-existing internal-only normalization used inside
+# normalize_dataframe() -- to actually rewrite the source DataFrame (and,
+# in the folder workflow, the source file on disk) so the converted
+# MM-DD-YYYY values are what gets archived.
+
+import re
+
+
+def _parses_as_date_string(s):
+    """
+    True if `s` (a stripped string) contains an explicit date separator
+    ('-' or '/') AND pandas can parse it as a real date. Requiring a
+    separator is what keeps plain numeric IDs like "100" or "77960"
+    (flight numbers, pax counts, etc.) from ever being mistaken for dates
+    just because they happen to be numeric.
+    """
+    if not s or not re.search(r"[-/]", s):
+        return False
+    parsed = pd.to_datetime(s, errors="coerce")
+    return not pd.isna(parsed)
+
+
+def _looks_like_date_series(series):
+    """
+    Heuristic: does this column hold date/datetime values? Two ways in:
+      1. Native date/datetime objects (Timestamp/datetime/date/
+         np.datetime64) -- this is how openpyxl represents Excel
+         date-formatted cells even though load_sheet() uses dtype=object,
+         so this signal is unambiguous. datetime.time values (clock times,
+         no date component) are explicitly excluded -- those belong to the
+         separate time-column pipeline above, not this one.
+      2. Text values that contain a date separator and parse cleanly via
+         pandas (see _parses_as_date_string) -- this deliberately excludes
+         plain digit strings so ID/flight-number/pax-count columns are
+         never converted just because they're numeric.
+    ALL sampled non-null values must match for the column to be treated as
+    a date column, so a column that's mostly free text is left alone even
+    if one value happens to be parseable.
+    """
+    import datetime  # local import: avoids clashing with the module-level
+                      # "from datetime import datetime" used further down
+                      # for the folder-workflow timestamp logic.
+    sample = series.dropna()
+    if len(sample) == 0:
+        return False
+    sample = sample.head(20)
+    hits = 0
+    for v in sample:
+        if isinstance(v, datetime.time):
+            continue
+        if isinstance(v, (pd.Timestamp, datetime.datetime, datetime.date, np.datetime64)):
+            hits += 1
+        elif isinstance(v, str) and _parses_as_date_string(v.strip()):
+            hits += 1
+    return hits == len(sample)
+
+
+def _to_mmddyyyy(v):
+    """
+    Convert a single date/datetime-like value to 'MM-DD-YYYY' text, with
+    the time-of-day component (hours/minutes/seconds/milliseconds) dropped
+    entirely. Non-date and missing values pass through unchanged.
+    """
+    import datetime  # local import: see note in _looks_like_date_series
+    if v is None:
+        return v
+    if isinstance(v, float) and pd.isna(v):
+        return v
+    if isinstance(v, datetime.time):
+        return v  # not a date value -- leave untouched
+    if isinstance(v, (pd.Timestamp, datetime.datetime, datetime.date, np.datetime64, str)):
+        parsed = pd.to_datetime(v, errors="coerce")
+        if not pd.isna(parsed):
+            return parsed.strftime("%m-%d-%Y")
+    return v
+
+
+def convert_date_columns_to_mmddyyyy(df, force_columns=None):
+    """
+    Detects date-related columns in `df` (dynamically via
+    _looks_like_date_series, plus any explicit overrides passed in
+    `force_columns` or listed in FORCE_DATE_COLUMNS) and converts their
+    values to 'MM-DD-YYYY' text, dropping the time-of-day portion
+    completely. Returns a NEW dataframe -- does not mutate the input.
+
+    Columns that merely contain numbers (flight numbers, IDs, pax counts,
+    etc.) are left completely untouched, since detection requires either a
+    real date/datetime object or a text value with an explicit date
+    separator that pandas can parse.
+    """
+    df = df.copy()
+    force = set(force_columns or []) | set(FORCE_DATE_COLUMNS)
+    for col in df.columns:
+        if col in force or _looks_like_date_series(df[col]):
+            df[col] = df[col].map(_to_mmddyyyy)
+    return df
+
+
+# ============================================================================
+# WRITE MODIFIED DATA BACK TO THE SOURCE FILE (so archives reflect changes)
+# ============================================================================
+
+def save_dataframe_to_source(df, path, sheet_name=0):
+    """
+    Writes `df` back to the ORIGINAL source file at `path`, overwriting its
+    data in place. Used so that any preprocessing applied in-memory
+    (autofill, date conversion, etc.) is reflected in the actual file
+    BEFORE that file gets moved to the archive folder.
+
+    - .csv / .tsv: the file is simply overwritten with the modified
+      dataframe.
+    - .xlsx / .xls: the existing workbook is loaded so other sheets and the
+      overall workbook structure are preserved; only the target sheet's
+      cell contents are cleared and rewritten from the dataframe.
+    """
+    from pathlib import Path as _Path
+    path = _Path(path)
+
+    if path.suffix.lower() in (".csv", ".tsv"):
+        sep = "\t" if path.suffix.lower() == ".tsv" else ","
+        df.to_csv(path, index=False, sep=sep)
+        return
+
+    import openpyxl
+    wb = openpyxl.load_workbook(path)
+    if isinstance(sheet_name, int):
+        ws = wb.worksheets[sheet_name]
+    else:
+        ws = wb[sheet_name]
+
+    # Clear existing rows on the target sheet only, then rewrite header +
+    # data from the (possibly modified) dataframe. Other sheets in the
+    # workbook are untouched.
+    if ws.max_row and ws.max_row > 0:
+        ws.delete_rows(1, ws.max_row)
+    ws.append([str(c) for c in df.columns])
+    for row in df.itertuples(index=False, name=None):
+        ws.append(list(row))
+
+    wb.save(path)
 
 
 # ============================================================================
@@ -262,18 +445,30 @@ def _normalize_time_value(v):
 
 
 def _normalize_date_value(v):
-    """Return YYYY-MM-DD for real datetimes and ISO-style datetime text."""
+    """
+    Return MM-DD-YYYY for real datetimes and date-like text (time-of-day
+    dropped entirely), so comparison never treats two different times on
+    the same date as a mismatch.
+
+    NOTE: by the time this runs inside normalize_dataframe(), date columns
+    have typically already been converted to 'MM-DD-YYYY' strings by
+    convert_date_columns_to_mmddyyyy() upstream (see run_comparison /
+    run_folder_comparison). This function is kept so compare_data() /
+    normalize_dataframe() still behave correctly on their own, and so any
+    date-like value that slipped through unconverted is still normalized
+    consistently at comparison time.
+    """
     import datetime
-    import re
 
     if isinstance(v, (pd.Timestamp, datetime.datetime, datetime.date, np.datetime64)):
         parsed = pd.to_datetime(v, errors="coerce")
-        return parsed.strftime("%Y-%m-%d") if not pd.isna(parsed) else v
-    # Restrict text parsing to unambiguous ISO dates, so ordinary identifiers
-    # and free text are never accidentally converted to dates.
-    if isinstance(v, str) and re.match(r"^\s*\d{4}-\d{1,2}-\d{1,2}(?:[ T].*)?\s*$", v):
+        return parsed.strftime("%m-%d-%Y") if not pd.isna(parsed) else v
+    # Restrict text parsing to values that look like dates (contain a date
+    # separator), so ordinary identifiers and free text are never
+    # accidentally converted to dates.
+    if isinstance(v, str) and _parses_as_date_string(v.strip()):
         parsed = pd.to_datetime(v.strip(), errors="coerce")
-        return parsed.strftime("%Y-%m-%d") if not pd.isna(parsed) else v
+        return parsed.strftime("%m-%d-%Y") if not pd.isna(parsed) else v
     return v
 
 
@@ -783,7 +978,9 @@ def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison
     print("LOADING SHEETS")
     print("=" * 70)
     df_a = load_sheet(path_a, sheet_a)
-    df_b = load_sheet(path_b, sheet_b)
+    # Sheet B is the Power BI input: expand only Excel-declared merged ranges
+    # before pandas creates its dataframe.
+    df_b = load_sheet(path_b, sheet_b, expand_powerbi_merges=True)
     if interactive_autofill:
         df_a = prompt_for_autofill(df_a, "SheetA")
         df_b = prompt_for_autofill(df_b, "SheetB")
@@ -791,6 +988,11 @@ def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison
         print(f"Forward-filling merged-cell columns: {FORWARD_FILL_COLUMNS}")
         df_a = forward_fill_merged_cells(df_a, FORWARD_FILL_COLUMNS)
         df_b = forward_fill_merged_cells(df_b, FORWARD_FILL_COLUMNS)
+    # Convert date/datetime columns to MM-DD-YYYY (time dropped) before the
+    # rest of the pipeline runs, so schema/row-count/data comparison all see
+    # the normalized date representation.
+    df_a = convert_date_columns_to_mmddyyyy(df_a)
+    df_b = convert_date_columns_to_mmddyyyy(df_b)
     print(f"Sheet A: {path_a!r} (sheet={sheet_a!r}) -> {df_a.shape[0]} rows, {df_a.shape[1]} cols")
     print(f"Sheet B: {path_b!r} (sheet={sheet_b!r}) -> {df_b.shape[0]} rows, {df_b.shape[1]} cols")
 
@@ -904,15 +1106,11 @@ from datetime import datetime
 
 # ---- EDIT THESE FOLDER PATHS ONCE, THEN NEVER TOUCH THEM AGAIN ----
 TABLEAU_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\NeedToTestTBL")
-
 POWERBI_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\NeedToTestPBI")
-
 ARCHIVE_TABLEAU_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Tableau_Archive")
-
 ARCHIVE_POWERBI_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Powerbi_Archive")
-
 RESULT_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Comparision_Tbl_PBI")
-
+ 
 # File extensions to look for when auto-discovering the file in each folder.
 VALID_EXTENSIONS = (".xlsx", ".xls", ".csv")
 
@@ -945,12 +1143,35 @@ def _find_single_file(folder):
     return candidates[0]
 
 
-def _load_any(path, sheet_name=0):
+def _load_any(path, sheet_name=0, expand_powerbi_merges=False):
     """Reads .xlsx/.xls via load_sheet(), or .csv directly, based on extension."""
     path = Path(path)
     if path.suffix.lower() == ".csv":
         return pd.read_csv(path, dtype=object)
-    return load_sheet(path, sheet_name)
+    return load_sheet(path, sheet_name, expand_powerbi_merges=expand_powerbi_merges)
+
+
+def _preprocess_and_save(path, sheet_index, sheet_label, interactive_autofill,
+                         expand_powerbi_merges=False):
+    """
+    Loads a source file, applies (in order) user-selected autofill,
+    configured merged-cell forward-fill, and date-column conversion to
+    MM-DD-YYYY, then writes the result BACK to the same source file on
+    disk so the modifications are preserved before archiving.
+
+    Returns the modified in-memory dataframe (already reflecting exactly
+    what was written to disk) so the caller doesn't need to re-read the
+    file.
+    """
+    df = _load_any(path, sheet_index, expand_powerbi_merges=expand_powerbi_merges)
+    if interactive_autofill:
+        df = prompt_for_autofill(df, sheet_label)
+    if FORWARD_FILL_COLUMNS:
+        print(f"Forward-filling merged-cell columns in {sheet_label}: {FORWARD_FILL_COLUMNS}")
+        df = forward_fill_merged_cells(df, FORWARD_FILL_COLUMNS)
+    df = convert_date_columns_to_mmddyyyy(df)
+    save_dataframe_to_source(df, path, sheet_index)
+    return df
 
 
 def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
@@ -959,13 +1180,20 @@ def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
     """
     Full folder-based workflow:
       1. Auto-find the one file in TABLEAU_FOLDER (Sheet A) and POWERBI_FOLDER (Sheet B).
-      2. Run the full comparison (schema, row counts, data, likely-edited pairing).
-      3. Write results to RESULT_FOLDER as:
+      2. For each file: load -> autofill -> merged-cell fill -> convert date
+         columns to MM-DD-YYYY -> SAVE the modified data back to that same
+         source file on disk (so the file itself now reflects every change
+         made during preprocessing).
+      3. Run the full comparison (schema, row counts, data, likely-edited
+         pairing) using the modified data.
+      4. Write results to RESULT_FOLDER as:
              <TableauFileName>_<YYYYMMDD>_<HHMMSS>.xlsx
-      4. Move the source files into their Archive folders as:
+      5. Move the (now-modified) source files into their Archive folders as:
              <filename>_TBL_<YYYYMMDD>.xlsx   (from Tableau folder)
              <filename>_PBI_<YYYYMMDD>.xlsx   (from Powerbi folder)
-         so the source folders are empty again and ready for the next run.
+         so the source folders are empty again and ready for the next run,
+         and the archive contains the actual processed input, not the
+         untouched original.
     """
     RESULT_FOLDER.mkdir(parents=True, exist_ok=True)
     ARCHIVE_TABLEAU_FOLDER.mkdir(parents=True, exist_ok=True)
@@ -994,16 +1222,21 @@ def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
     date_str = now.strftime("%Y%m%d")
     time_str = now.strftime("%H%M%S")
 
-    # ---- 2. Load + run the existing comparison pipeline ----
-    df_a = _load_any(path_a, sheet_a_index)
-    df_b = _load_any(path_b, sheet_b_index)
-    if interactive_autofill:
-        df_a = prompt_for_autofill(df_a, "SheetA")
-        df_b = prompt_for_autofill(df_b, "SheetB")
-    if FORWARD_FILL_COLUMNS:
-        print(f"Forward-filling merged-cell columns: {FORWARD_FILL_COLUMNS}")
-        df_a = forward_fill_merged_cells(df_a, FORWARD_FILL_COLUMNS)
-        df_b = forward_fill_merged_cells(df_b, FORWARD_FILL_COLUMNS)
+    # ---- 2. Per-file preprocessing, with the modified data written back to
+    # the source file BEFORE comparison/archiving (Sheet A fully processed
+    # and saved, then Sheet B fully processed and saved) ----
+    print("\n" + "=" * 70)
+    print("PREPROCESSING SHEET A (autofill -> date conversion -> save to source file)")
+    print("=" * 70)
+    df_a = _preprocess_and_save(path_a, sheet_a_index, "SheetA", interactive_autofill)
+
+    print("\n" + "=" * 70)
+    print("PREPROCESSING SHEET B (autofill -> date conversion -> save to source file)")
+    print("=" * 70)
+    df_b = _preprocess_and_save(
+        path_b, sheet_b_index, "SheetB", interactive_autofill,
+        expand_powerbi_merges=True,
+    )
 
     schema = compare_schema(df_a, df_b)
     df_b_comparison = align_common_headers(df_b, schema)
@@ -1077,7 +1310,7 @@ def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
 
     print(f"\nResult written to: {output_path}")
 
-    # ---- 4. Archive the source files ----
+    # ---- 4. Archive the (already-modified-on-disk) source files ----
     archived_a = ARCHIVE_TABLEAU_FOLDER / f"{path_a.stem}_TBL_{date_str}{path_a.suffix}"
     archived_b = ARCHIVE_POWERBI_FOLDER / f"{path_b.stem}_PBI_{date_str}{path_b.suffix}"
 
@@ -1090,8 +1323,8 @@ def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
 
     shutil.move(str(path_a), str(archived_a))
     shutil.move(str(path_b), str(archived_b))
-    print(f"Archived Tableau file -> {archived_a}")
-    print(f"Archived Powerbi file -> {archived_b}")
+    print(f"Archived Tableau file (modified) -> {archived_a}")
+    print(f"Archived Powerbi file (modified) -> {archived_b}")
     print("\nDone. Source folders are now empty and ready for the next run.")
 
 
