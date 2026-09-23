@@ -38,6 +38,27 @@ FORCE_DATE_COLUMNS = []  # e.g. ["Flight Date", "Booking Date"]
 
 
 # ============================================================================
+# RESULT HIGHLIGHTING CONFIGURATION (NEW -- output formatting only)
+# ============================================================================
+# These control the cell fill colors applied to the GENERATED RESULT
+# workbook after it is written. Nothing here affects comparison logic in any
+# way -- the comparison runs exactly as before, and this is purely a
+# post-processing pass over the finished output file so the differences that
+# were already identified are visually obvious instead of having to be
+# hunted for by eye.
+#
+# All colors are deliberately LIGHT/pastel so black cell text stays readable
+# and printing/screenshotting the report still looks clean. Values are plain
+# 6-digit RRGGBB hex strings (openpyxl format, no leading '#').
+HIGHLIGHT_RESULTS = True                 # set False to write a plain, unhighlighted workbook
+
+HIGHLIGHT_CHANGED_VALUE_COLOR = "FFF2CC"  # light amber  -- a value that differs between A and B
+HIGHLIGHT_EXTRA_IN_A_COLOR    = "FCE4E4"  # light red    -- rows/columns present (or excess) in A only
+HIGHLIGHT_EXTRA_IN_B_COLOR    = "DDEBF7"  # light blue   -- rows/columns present (or excess) in B only
+HIGHLIGHT_SUMMARY_COLOR       = "FFF2CC"  # light amber  -- non-zero difference metrics on Summary
+
+
+# ============================================================================
 # STEP 0: LOAD
 # ============================================================================
 
@@ -964,6 +985,243 @@ def find_likely_edited_pairs(extra_in_a, extra_in_b, common_columns,
 
 
 # ============================================================================
+# RESULT HIGHLIGHTING (NEW -- runs AFTER the result workbook is written)
+# ============================================================================
+# Everything below is pure output formatting. It re-opens the finished
+# result .xlsx with openpyxl and paints a light background fill on the cells
+# that represent the differences ALREADY identified by the comparison above.
+# No comparison logic is re-run, no values are recalculated, and no data is
+# added, removed, or reordered -- only cell fill colors are set. If anything
+# in here fails for any reason, the failure is caught and reported, and the
+# (already complete and correct) workbook is simply left unhighlighted.
+#
+# Colour key, applied consistently across every sheet:
+#   light amber (HIGHLIGHT_CHANGED_VALUE_COLOR) -> a value that DIFFERS
+#   light red   (HIGHLIGHT_EXTRA_IN_A_COLOR)    -> present/excess in A only
+#   light blue  (HIGHLIGHT_EXTRA_IN_B_COLOR)    -> present/excess in B only
+
+def _solid_fill(hex_color):
+    """Build a solid openpyxl PatternFill from a 6-digit RRGGBB hex string."""
+    from openpyxl.styles import PatternFill
+    return PatternFill(start_color=hex_color, end_color=hex_color, fill_type="solid")
+
+
+def _header_index_map(ws):
+    """
+    Map {header text -> 1-based column index} by reading row 1 of a
+    worksheet. Reading the headers back off the sheet (rather than assuming
+    a fixed column order) keeps this robust if the column layout of any
+    result sheet ever changes.
+    """
+    headers = {}
+    for cell in ws[1]:
+        if cell.value is not None:
+            headers[str(cell.value)] = cell.column
+    return headers
+
+
+def _highlight_entire_data_rows(ws, fill):
+    """Fill every populated data cell (row 2 downward) on a worksheet."""
+    if ws.max_row is None or ws.max_row < 2:
+        return 0
+    filled_rows = 0
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row,
+                            min_col=1, max_col=ws.max_column):
+        for cell in row:
+            cell.fill = fill
+        filled_rows += 1
+    return filled_rows
+
+
+def _highlight_column_by_name(ws, header_name, fill):
+    """Fill every data cell under one named column, if that column exists."""
+    headers = _header_index_map(ws)
+    col_idx = headers.get(header_name)
+    if not col_idx or ws.max_row is None or ws.max_row < 2:
+        return 0
+    count = 0
+    for row_idx in range(2, ws.max_row + 1):
+        ws.cell(row=row_idx, column=col_idx).fill = fill
+        count += 1
+    return count
+
+
+def _highlight_mismatched_records(ws, fill):
+    """
+    MismatchedRecords (wide format): for each matched pair, read that row's
+    'DifferingColumns' value and highlight ONLY the '<col> [A]' and
+    '<col> [B]' cells for the columns actually named there. Columns that
+    matched between the two sheets stay unhighlighted, so what changed
+    jumps out immediately even on a very wide record.
+    """
+    headers = _header_index_map(ws)
+    diff_idx = headers.get("DifferingColumns")
+    if not diff_idx or ws.max_row is None or ws.max_row < 2:
+        return 0
+
+    highlighted = 0
+    for row_idx in range(2, ws.max_row + 1):
+        raw = ws.cell(row=row_idx, column=diff_idx).value
+        if raw in (None, "", "(identical)"):
+            continue
+        for name in [part.strip() for part in str(raw).split(",") if part.strip()]:
+            for suffix in ("[A]", "[B]"):
+                col_idx = headers.get(f"{name} {suffix}")
+                if col_idx:
+                    ws.cell(row=row_idx, column=col_idx).fill = fill
+                    highlighted += 1
+        # Also tint the DifferingColumns cell itself so the row is easy to
+        # spot when scrolling horizontally through a wide pair record.
+        ws.cell(row=row_idx, column=diff_idx).fill = fill
+    return highlighted
+
+
+def _highlight_mismatched_records_short(ws, fill_a, fill_b, fill_changed):
+    """
+    MismatchedRecordsShort (long format): every row here IS a difference,
+    so highlight the Column name (amber), the A value (light red) and the
+    B value (light blue) -- side-by-side colours make it obvious at a glance
+    which sheet each value came from.
+    """
+    headers = _header_index_map(ws)
+    if ws.max_row is None or ws.max_row < 2:
+        return 0
+    targets = [
+        ("Column", fill_changed),
+        ("ValueInA", fill_a),
+        ("ValueInB", fill_b),
+    ]
+    count = 0
+    for row_idx in range(2, ws.max_row + 1):
+        for header_name, fill in targets:
+            col_idx = headers.get(header_name)
+            if col_idx:
+                ws.cell(row=row_idx, column=col_idx).fill = fill
+                count += 1
+    return count
+
+
+def _highlight_summary(ws, fill):
+    """
+    Summary: highlight the Value cell of any metric that represents a
+    detected difference and is NON-ZERO. Metrics that are simply
+    descriptive (file names, total column/row counts) and differences that
+    came out as zero are deliberately left plain, so the highlighted cells
+    are exactly the ones worth investigating.
+    """
+    headers = _header_index_map(ws)
+    metric_idx = headers.get("Metric")
+    value_idx = headers.get("Value")
+    if not metric_idx or not value_idx or ws.max_row is None or ws.max_row < 2:
+        return 0
+
+    difference_metrics = {
+        "Columns only in A",
+        "Columns only in B",
+        "Row count difference (A-B)",
+        "Distinct row-combos extra in A",
+        "Distinct row-combos extra in B",
+        "Likely-edited pairs found",
+        "Still-unmatched extra rows in A",
+        "Still-unmatched extra rows in B",
+    }
+
+    count = 0
+    for row_idx in range(2, ws.max_row + 1):
+        metric = ws.cell(row=row_idx, column=metric_idx).value
+        if metric not in difference_metrics:
+            continue
+        value = ws.cell(row=row_idx, column=value_idx).value
+        try:
+            is_nonzero = float(value) != 0
+        except (TypeError, ValueError):
+            is_nonzero = False
+        if is_nonzero:
+            ws.cell(row=row_idx, column=metric_idx).fill = fill
+            ws.cell(row=row_idx, column=value_idx).fill = fill
+            count += 1
+    return count
+
+
+def highlight_result_workbook(output_path):
+    """
+    Post-process the generated result workbook at `output_path`, applying a
+    light background fill to every cell that represents an identified
+    difference. Called at the very end of run_comparison() and
+    run_folder_comparison(), immediately after the workbook is written.
+
+    Sheet-by-sheet behaviour:
+      Summary                -> non-zero difference metrics (amber)
+      MissingInB             -> each column name found only in A (light red)
+      MissingInA             -> each column name found only in B (light blue)
+      ExtraInA               -> whole row (light red)
+      ExtraInB               -> whole row (light blue)
+      MismatchedRecords      -> only the '[A]'/'[B]' cells whose column is
+                                listed in that row's DifferingColumns (amber)
+      MismatchedRecordsShort -> Column (amber), ValueInA (red), ValueInB (blue)
+      UnmatchedInA           -> whole row (light red)
+      UnmatchedInB           -> whole row (light blue)
+
+    Purely cosmetic and fully optional: set HIGHLIGHT_RESULTS = False at the
+    top of the file to skip it, and any unexpected error here is caught and
+    printed without disturbing the workbook that was already written.
+    """
+    if not HIGHLIGHT_RESULTS:
+        return
+
+    try:
+        import openpyxl
+
+        fill_changed = _solid_fill(HIGHLIGHT_CHANGED_VALUE_COLOR)
+        fill_a = _solid_fill(HIGHLIGHT_EXTRA_IN_A_COLOR)
+        fill_b = _solid_fill(HIGHLIGHT_EXTRA_IN_B_COLOR)
+        fill_summary = _solid_fill(HIGHLIGHT_SUMMARY_COLOR)
+
+        wb = openpyxl.load_workbook(output_path)
+
+        if "Summary" in wb.sheetnames:
+            _highlight_summary(wb["Summary"], fill_summary)
+
+        # Schema differences: the single column of names on each sheet IS
+        # the difference, so the whole column gets tinted.
+        if "MissingInB" in wb.sheetnames:
+            _highlight_column_by_name(wb["MissingInB"], "ColumnOnlyInA", fill_a)
+        if "MissingInA" in wb.sheetnames:
+            _highlight_column_by_name(wb["MissingInA"], "ColumnOnlyInB", fill_b)
+
+        # Extra / unmatched rows: the ENTIRE row is the finding (this whole
+        # record is excess on one side), so the full row is tinted rather
+        # than any individual cell.
+        for sheet_name, fill in (
+            ("ExtraInA", fill_a),
+            ("ExtraInB", fill_b),
+            ("UnmatchedInA", fill_a),
+            ("UnmatchedInB", fill_b),
+        ):
+            if sheet_name in wb.sheetnames:
+                _highlight_entire_data_rows(wb[sheet_name], fill)
+
+        # Likely-edited pairs: only the fields that actually changed.
+        if "MismatchedRecords" in wb.sheetnames:
+            _highlight_mismatched_records(wb["MismatchedRecords"], fill_changed)
+        if "MismatchedRecordsShort" in wb.sheetnames:
+            _highlight_mismatched_records_short(
+                wb["MismatchedRecordsShort"], fill_a, fill_b, fill_changed
+            )
+
+        wb.save(output_path)
+        print(
+            "Highlighting applied to result workbook "
+            f"(changed={HIGHLIGHT_CHANGED_VALUE_COLOR}, "
+            f"extra-in-A={HIGHLIGHT_EXTRA_IN_A_COLOR}, "
+            f"extra-in-B={HIGHLIGHT_EXTRA_IN_B_COLOR})."
+        )
+    except Exception as exc:  # never let cosmetics break a finished report
+        print(f"[WARNING] Could not apply highlighting to {output_path}: {exc}")
+        print("The result workbook itself was written successfully and is complete.")
+
+
+# ============================================================================
 # ORCHESTRATION
 # ============================================================================
 
@@ -1085,6 +1343,9 @@ def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison
         unmatched_a.to_excel(writer, sheet_name="UnmatchedInA", index=False)
         unmatched_b.to_excel(writer, sheet_name="UnmatchedInB", index=False)
 
+    # ---- HIGHLIGHT THE IDENTIFIED DIFFERENCES (cosmetic post-processing) ----
+    highlight_result_workbook(output_path)
+
     print("Done.")
 
 
@@ -1105,11 +1366,23 @@ from pathlib import Path
 from datetime import datetime
 
 # ---- EDIT THESE FOLDER PATHS ONCE, THEN NEVER TOUCH THEM AGAIN ----
+
+ 
 TABLEAU_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\NeedToTestTBL")
 POWERBI_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\NeedToTestPBI")
 ARCHIVE_TABLEAU_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Tableau_Archive")
 ARCHIVE_POWERBI_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Powerbi_Archive")
 RESULT_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Comparision_Tbl_PBI")
+
+# BASE_FOLDER = Path(__file__).resolve().parent
+ 
+# TABLEAU_FOLDER = BASE_FOLDER / "NeedToTestTBL"
+# POWERBI_FOLDER = BASE_FOLDER / "NeedToTestPBI"
+ 
+# ARCHIVE_TABLEAU_FOLDER = BASE_FOLDER / "Tableau_Archive"
+# ARCHIVE_POWERBI_FOLDER = BASE_FOLDER / "Powerbi_Archive"
+ 
+# RESULT_FOLDER = BASE_FOLDER / "Comparision_Tbl_PBI"
  
 # File extensions to look for when auto-discovering the file in each folder.
 VALID_EXTENSIONS = (".xlsx", ".xls", ".csv")
@@ -1188,6 +1461,7 @@ def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
          pairing) using the modified data.
       4. Write results to RESULT_FOLDER as:
              <TableauFileName>_<YYYYMMDD>_<HHMMSS>.xlsx
+         and then highlight every identified difference in that workbook.
       5. Move the (now-modified) source files into their Archive folders as:
              <filename>_TBL_<YYYYMMDD>.xlsx   (from Tableau folder)
              <filename>_PBI_<YYYYMMDD>.xlsx   (from Powerbi folder)
@@ -1307,6 +1581,9 @@ def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
         pairs_df.to_excel(writer, sheet_name="MismatchedRecordsShort", index=False)      # just the differing fields
         unmatched_a.to_excel(writer, sheet_name="UnmatchedInA", index=False)
         unmatched_b.to_excel(writer, sheet_name="UnmatchedInB", index=False)
+
+    # ---- HIGHLIGHT THE IDENTIFIED DIFFERENCES (cosmetic post-processing) ----
+    highlight_result_workbook(output_path)
 
     print(f"\nResult written to: {output_path}")
 
