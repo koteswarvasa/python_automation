@@ -109,45 +109,70 @@ def load_sheet(path, sheet_name=0, expand_powerbi_merges=False):
     sheet_name : str or int
         Sheet name or index to read (default: first sheet).
 
+    Also detects which cells are PERCENTAGE-FORMATTED in the source
+    workbook. Excel stores a percentage as a plain fraction -- e.g. 0.63%
+    is stored internally as the number 0.0063 -- with "%" applied purely
+    as a display format (cell.number_format, e.g. "0.00%") that a plain
+    value read never exposes. Without tracking this separately, a
+    percent-formatted numeric cell and a sheet that stores the same
+    percentage as literal text ("0.63%") would normalize to two
+    completely different-looking values and always appear to mismatch.
+    See convert_percent_columns_to_text() for how this mask is used.
+
     Returns
     -------
-    pandas.DataFrame
-        The raw sheet data, with headers untouched and all values read as
-        openpyxl/pandas naturally infers them (dtype normalization happens
-        later, explicitly, in compare_data()).
+    (pandas.DataFrame, pandas.DataFrame)
+        The raw sheet data (headers untouched, values read as openpyxl
+        naturally infers them -- dtype normalization happens later,
+        explicitly, in compare_data()), and a same-shape, same-column-
+        names boolean DataFrame marking which cells were percentage-
+        formatted in the source workbook.
     """
-    # engine="openpyxl" reads .xlsx reliably; dtype=object keeps pandas from
-    # silently coercing types on read (e.g. turning "007" into 7), so we can
-    # inspect and normalize types ourselves in a controlled, visible step.
-    if expand_powerbi_merges:
-        # Expand a *copy in memory*.  The comparison representation needs
-        # every member of an Excel merged range to have its logical value,
-        # but the original workbook must remain available for report display
-        # and must not be changed merely by loading it.
-        import openpyxl
+    # Read cell-by-cell via openpyxl (rather than pd.read_excel) so each
+    # cell's number_format can be captured alongside its value -- pandas'
+    # own Excel reader discards that formatting information entirely.
+    import openpyxl
 
-        wb = openpyxl.load_workbook(path)
-        ws = wb.worksheets[sheet_name] if isinstance(sheet_name, int) else wb[sheet_name]
+    wb = openpyxl.load_workbook(path)
+    ws = wb.worksheets[sheet_name] if isinstance(sheet_name, int) else wb[sheet_name]
+
+    if expand_powerbi_merges:
+        # Expand merges in this in-memory workbook. The comparison
+        # representation needs every member of an Excel merged range to
+        # have its logical value AND its number_format -- otherwise a
+        # non-anchor cell that's now holding a copied percent value could
+        # still show "General" format and be missed by the percent-mask
+        # detection below.
         for merged_range in list(ws.merged_cells.ranges):
             min_col, min_row, max_col, max_row = merged_range.bounds
-            value = ws.cell(row=min_row, column=min_col).value
+            top_left = ws.cell(row=min_row, column=min_col)
+            value, number_format = top_left.value, top_left.number_format
             ws.unmerge_cells(str(merged_range))
             for row in ws.iter_rows(min_row=min_row, max_row=max_row,
                                     min_col=min_col, max_col=max_col):
                 for cell in row:
                     cell.value = value
-        buffer = BytesIO()
-        wb.save(buffer)
-        buffer.seek(0)
-        df = pd.read_excel(buffer, sheet_name=sheet_name, engine="openpyxl", dtype=object)
-    else:
-        df = pd.read_excel(path, sheet_name=sheet_name, engine="openpyxl", dtype=object)
+                    cell.number_format = number_format
 
-    # pandas.read_excel does NOT strip header whitespace by default, but we
-    # assert/document that explicitly here so future pandas versions or
-    # accidental changes don't silently break this guarantee.
-    # (No transformation is applied to df.columns -- this is intentional.)
-    return df
+    # Header row: used exactly as found, no whitespace-stripping or other
+    # transformation, so a header difference like "Doors Closed" vs
+    # " Doors Closed" stays detectable rather than silently normalized away.
+    header = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+
+    data_rows, percent_rows = [], []
+    last_row = ws.max_row or 1
+    if last_row >= 2:
+        for row in ws.iter_rows(min_row=2, max_row=last_row):
+            values, percents = [], []
+            for cell in row:
+                values.append(cell.value)
+                percents.append(cell.number_format is not None and "%" in cell.number_format)
+            data_rows.append(values)
+            percent_rows.append(percents)
+
+    df = pd.DataFrame(data_rows, columns=header)
+    percent_mask = pd.DataFrame(percent_rows, columns=header)
+    return df, percent_mask
 
 
 # ============================================================================
@@ -171,32 +196,79 @@ FORWARD_FILL_COLUMNS = []  # e.g. ["Entry Date", "StaffID", "Full Name"]
 
 # MODIFIED: FORWARD FILL
 # NEW: AUTO-FILL TRACKING
+def _ffill_one_column_by_position(df, col_pos):
+    """
+    Forward-fills blank cells in the column at integer position `col_pos`,
+    on the assumption that the blanks come from merged cells in the
+    original spreadsheet (a value only present on the first row of a
+    repeated block). Mutates `df` in place (caller is expected to have
+    already copied it) using positional access throughout, so it is safe
+    even when multiple columns share the same (possibly blank/None)
+    header -- label-based access like df[col_name] silently returns/sets
+    EVERY column with that label at once, which is not what "autofill
+    this one column" means.
+
+    Returns the set of `(column_name, original_dataframe_index)` pairs for
+    precisely the cells that changed from blank to a prior value.
+    """
+    col_name = df.columns[col_pos]
+    values = df.iloc[:, col_pos].copy()
+    # ffill only recognizes NaN, while exports often represent blank merged
+    # cells as empty/whitespace strings. Convert those to missing first.
+    # pandas leaves leading missing values missing, which is the required
+    # first-row behavior.
+    blank = values.isna() | values.map(lambda v: isinstance(v, str) and not v.strip())
+    filled = values.mask(blank).ffill()
+    # A leading blank remains missing after ffill and was not auto-filled.
+    # Only record cells for which ffill supplied a usable previous value.
+    actually_filled = blank & filled.notna()
+    autofilled_cells = {(col_name, index) for index in df.index[actually_filled]}
+    df.isetitem(col_pos, filled)
+    return autofilled_cells
+
+
 def forward_fill_merged_cells(df, columns):
     """
-    Forward-fills blank cells in the given columns, on the assumption that
-    the blanks come from merged cells in the original spreadsheet (a value
-    only present on the first row of a repeated block). Returns a NEW
-    dataframe -- does not mutate the input.  Also returns a set of
-    ``(column_name, original_dataframe_index)`` pairs for precisely the
-    cells that changed from blank to a prior value.
+    Forward-fills blank cells in the given columns (by NAME), on the
+    assumption that the blanks come from merged cells in the original
+    spreadsheet. Returns a NEW dataframe -- does not mutate the input.
+    Also returns a set of ``(column_name, original_dataframe_index)``
+    pairs for precisely the cells that changed from blank to a prior
+    value.
+
+    NOTE: this name-based entry point is kept for FORWARD_FILL_COLUMNS
+    (a short, hand-typed config list). If a name in `columns` happens to
+    match more than one column (e.g. duplicate/blank headers), EVERY
+    matching column is filled -- that is the documented behavior for this
+    name-based path. The interactive prompt (prompt_for_autofill) does
+    NOT use this function for that reason; it fills by exact column
+    position instead, see forward_fill_merged_cells_by_position below.
     """
     df = df.copy()
     autofilled_cells = set()
     for col in columns:
         if col in df.columns:
-            # ffill only recognizes NaN, while exports often represent blank
-            # merged cells as empty/whitespace strings.  Convert those to
-            # missing first.  pandas leaves leading missing values missing,
-            # which is the required first-row behavior.
-            values = df[col].copy()
-            blank = values.isna() | values.map(lambda v: isinstance(v, str) and not v.strip())
-            filled = values.mask(blank).ffill()
-            # A leading blank remains missing after ffill and was not
-            # auto-filled.  Only record cells for which ffill supplied a
-            # usable previous value.
-            actually_filled = blank & filled.notna()
-            autofilled_cells.update((col, index) for index in df.index[actually_filled])
-            df[col] = filled
+            positions = [i for i, name in enumerate(df.columns) if name == col]
+            for col_pos in positions:
+                autofilled_cells.update(_ffill_one_column_by_position(df, col_pos))
+    return df, autofilled_cells
+
+
+def forward_fill_merged_cells_by_position(df, positions):
+    """
+    Forward-fills blank cells in the columns at the given integer
+    positions (0-based). Returns a NEW dataframe -- does not mutate the
+    input -- plus the set of `(column_name, original_dataframe_index)`
+    pairs that were actually filled.
+
+    Unlike forward_fill_merged_cells (name-based), this only ever touches
+    the exact column(s) the caller pointed at, even if other columns
+    happen to share the same (or a blank/None) header label.
+    """
+    df = df.copy()
+    autofilled_cells = set()
+    for col_pos in positions:
+        autofilled_cells.update(_ffill_one_column_by_position(df, col_pos))
     return df, autofilled_cells
 
 
@@ -223,8 +295,13 @@ def prompt_for_autofill(df, sheet_label):
             indices = [int(item.strip()) for item in selected.split(",") if item.strip()]
             if not indices or any(index < 1 or index > len(columns) for index in indices):
                 raise ValueError
-            selected_columns = list(dict.fromkeys(columns[index - 1] for index in indices))
-            return forward_fill_merged_cells(df, selected_columns)
+            # Positional, not name-based: some exports have duplicate or
+            # blank (None) headers, and selecting by name would silently
+            # fill EVERY column sharing that label instead of just the one
+            # the user picked (df[col] returns/sets all matching columns
+            # at once when a label isn't unique).
+            positions = list(dict.fromkeys(index - 1 for index in indices))
+            return forward_fill_merged_cells_by_position(df, positions)
         except ValueError:
             print("Enter one or more valid column numbers, separated by commas.")
 
@@ -232,102 +309,381 @@ def prompt_for_autofill(df, sheet_label):
 # ============================================================================
 # DATE COLUMN DETECTION + CONVERSION (MM-DD-YYYY, time dropped entirely)
 # ============================================================================
-# This section is new. It is used both to normalize dates for comparison
-# and -- unlike the pre-existing internal-only normalization used inside
-# normalize_dataframe() -- to actually rewrite the source DataFrame (and,
-# in the folder workflow, the source file on disk) so the converted
-# MM-DD-YYYY values are what gets archived.
+# This section handles MULTIPLE real-world date formats -- numeric
+# (little/middle/big-endian, any separator), spelled-out month names, ISO
+# 8601 with time/zone, ISO week dates (with an explicit weekday digit),
+# ordinal/Julian dates, and RFC 2822 -- rather than assuming one fixed
+# layout. It is used both to normalize dates for comparison and to actually
+# rewrite the source DataFrame (and, in the folder workflow, the source
+# file on disk) so the converted MM-DD-YYYY values are what gets archived.
+#
+# Deliberately UNSUPPORTED (returns the original value unparsed rather than
+# guessing, since none of these can be resolved from the string alone):
+#   - 2-digit-year numeric dates ("05-06-07" -- which part is the year, and
+#     which century, is genuinely ambiguous)
+#   - Bare integers as Unix epoch timestamps (indistinguishable from a
+#     numeric ID/invoice/phone number by content alone)
+#   - ISO week dates with no weekday digit ("2026-W39" -- which day of that
+#     7-day week is meant is not present in the string)
 
 import re
+import datetime as _dt
+from email.utils import parsedate_to_datetime
+
+_MONTH_WORD_RE = re.compile(
+    r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", re.IGNORECASE
+)
+
+# Used only when a date column has ZERO unambiguous day/month evidence in
+# its own data (see _infer_dayfirst_for_series below). Change this if your
+# organization's default convention for such columns is day-first instead.
+DEFAULT_DAYFIRST_WHEN_AMBIGUOUS = False  # False = assume MM/DD (US-style)
 
 
-def _parses_as_date_string(s):
-    """
-    True if `s` (a stripped string) contains an explicit date separator
-    ('-' or '/') AND pandas can parse it as a real date. Requiring a
-    separator is what keeps plain numeric IDs like "100" or "77960"
-    (flight numbers, pax counts, etc.) from ever being mistaken for dates
-    just because they happen to be numeric.
-    """
-    if not s or not re.search(r"[-/]", s):
+def _is_nan(v):
+    try:
+        return pd.isna(v)
+    except (TypeError, ValueError):
         return False
-    parsed = pd.to_datetime(s, errors="coerce")
-    return not pd.isna(parsed)
+
+
+def _parse_flexible_date(v, dayfirst=None):
+    """
+    Parse a single date-like value using structural rules, falling back to
+    an explicit `dayfirst` decision ONLY for the genuinely ambiguous
+    4-digit-year numeric case (e.g. "4/1/2024"). Returns a
+    pandas.Timestamp, or pd.NaT if it can't be confidently parsed.
+
+    Priority order (most-specific / least-ambiguous first):
+      1. Already a real date/datetime object -> pass through untouched.
+      2. ISO week date WITH explicit weekday digit (YYYY-Www-D).
+      3. Ordinal/Julian date (YYYY/DDD or DDD/YYYY).
+      4. RFC 2822 (stdlib email parser -- exact per spec, no guessing).
+      5. Contains a spelled-out month name -> unambiguous, hand to pandas
+         directly (covers "September 23, 2026", "23 September 2026",
+         "Sep 23, 2026", "Wednesday, September 23, 2026", "23-SEP-2026").
+      6. ISO 8601 with time/zone component (YYYY-MM-DDTHH:MM:SSZ etc).
+      7. Plain numeric date with exactly one 4-digit part -> that part IS
+         the year; if it's first, order is fixed (Y-M-D); if it's last,
+         the other two need `dayfirst` to disambiguate (covers
+         DD/MM/YYYY, MM/DD/YYYY, DD-MM-YYYY, MM-DD-YYYY, DD.MM.YYYY,
+         YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD).
+      Anything else (2-digit-year numeric dates, bare integers, weekday-
+      less ISO weeks, unparseable text) -> pd.NaT, left unparsed.
+    """
+    if v is None or (isinstance(v, float) and _is_nan(v)):
+        return pd.NaT
+    if isinstance(v, (pd.Timestamp, _dt.datetime, _dt.date)):
+        return pd.Timestamp(v)
+    if not isinstance(v, str):
+        return pd.NaT
+
+    s = v.strip()
+    if not s:
+        return pd.NaT
+
+    # -- ISO week date, weekday digit REQUIRED: 2026-W39-3 --
+    m = re.match(r"^(\d{4})-W(\d{2})-(\d)$", s)
+    if m:
+        year, week, weekday = int(m[1]), int(m[2]), int(m[3])
+        try:
+            return pd.Timestamp(_dt.date.fromisocalendar(year, week, weekday))
+        except ValueError:
+            return pd.NaT
+        # NOTE: "YYYY-Www" with no trailing "-D" intentionally falls through
+        # to the numeric branch below, where it fails the 3-part check and
+        # correctly returns pd.NaT rather than guessing a weekday.
+
+    # -- Ordinal/Julian: YYYY/DDD or DDD/YYYY --
+    m = re.match(r"^(\d{4})[/-](\d{1,3})$", s) or re.match(r"^(\d{1,3})[/-](\d{4})$", s)
+    if m:
+        a, b = m[1], m[2]
+        year, doy = (int(a), int(b)) if len(a) == 4 else (int(b), int(a))
+        try:
+            return pd.Timestamp(_dt.date(year, 1, 1) + _dt.timedelta(days=doy - 1))
+        except ValueError:
+            return pd.NaT
+
+    # -- RFC 2822 (weekday + comma + numeric offset/named zone at the end) --
+    if "," in s and re.search(r"[+-]\d{4}$|GMT$|UTC$", s):
+        try:
+            return pd.Timestamp(parsedate_to_datetime(s))
+        except (TypeError, ValueError):
+            pass
+
+    # -- Spelled-out month name -> structurally unambiguous --
+    if _MONTH_WORD_RE.search(s):
+        return pd.to_datetime(s, errors="coerce")  # dayfirst irrelevant here
+
+    # -- ISO 8601 with time component --
+    if "T" in s or re.search(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}", s):
+        return pd.to_datetime(s.replace("Z", "+00:00"), errors="coerce")
+
+    # -- Plain numeric date: needs exactly one 4-digit part to be safe --
+    parts = re.split(r"[-/.]", s)
+    if len(parts) == 3 and all(p.isdigit() for p in parts):
+        lengths = [len(p) for p in parts]
+        if lengths.count(4) == 1:
+            nums = [int(p) for p in parts]
+            y_idx = lengths.index(4)
+            year = nums[y_idx]
+            rest = [n for i, n in enumerate(nums) if i != y_idx]
+            if y_idx == 0:
+                month, day = rest  # Y-M-D, order fixed by position
+            else:
+                month, day = (rest[1], rest[0]) if dayfirst else (rest[0], rest[1])
+            try:
+                return pd.Timestamp(_dt.date(year, month, day))
+            except ValueError:
+                return pd.NaT
+        # all parts <=2 digits (2-digit year) -- unsupported, falls through
+
+    return pd.NaT
+
+
+def _infer_dayfirst_for_series(series):
+    """
+    Scan a column's date-like strings for UNAMBIGUOUS evidence of day/month
+    order: a numeric date with exactly one 4-digit part, where the other
+    two parts include a value >12 (which can only be a day, never a
+    month). Returns True (day-first), False (month-first), or None (no
+    evidence found -- caller falls back to DEFAULT_DAYFIRST_WHEN_AMBIGUOUS).
+
+    Raises ValueError if the column contains unambiguous evidence for BOTH
+    conventions -- that means this one column genuinely mixes DD/MM and
+    MM/DD rows and cannot be safely auto-normalized without fixing the
+    source data.
+    """
+    saw_dayfirst = False
+    saw_monthfirst = False
+    for v in series.dropna():
+        if not isinstance(v, str):
+            continue  # real date/datetime objects are never ambiguous
+        s = v.strip()
+        if _MONTH_WORD_RE.search(s) or "T" in s or "W" in s:
+            continue  # not a plain D/M/Y numeric date -- no evidence here
+        parts = re.split(r"[-/.]", s)
+        if len(parts) != 3 or not all(p.isdigit() for p in parts):
+            continue
+        lengths = [len(p) for p in parts]
+        if lengths.count(4) != 1:
+            continue  # 2-digit-year case -- skipped, no evidence taken from it
+        nums = [int(p) for p in parts]
+        y_idx = lengths.index(4)
+        if y_idx == 0:
+            continue  # Y-M-D -- order is fixed, not evidence for D/M ambiguity
+        rest = [n for i, n in enumerate(nums) if i != y_idx]
+        first, second = rest
+        if first > 12 and second <= 12:
+            saw_dayfirst = True
+        elif second > 12 and first <= 12:
+            saw_monthfirst = True
+
+    if saw_dayfirst and saw_monthfirst:
+        raise ValueError(
+            "This column mixes DD/MM and MM/DD dates -- cannot safely "
+            "auto-detect a single convention. Fix the source data or "
+            "split the column before comparing."
+        )
+    if saw_dayfirst:
+        return True
+    if saw_monthfirst:
+        return False
+    return None
 
 
 def _looks_like_date_series(series):
     """
-    Heuristic: does this column hold date/datetime values? Two ways in:
+    Heuristic: does this column hold date/datetime values?
       1. Native date/datetime objects (Timestamp/datetime/date/
-         np.datetime64) -- this is how openpyxl represents Excel
-         date-formatted cells even though load_sheet() uses dtype=object,
-         so this signal is unambiguous. datetime.time values (clock times,
-         no date component) are explicitly excluded -- those belong to the
-         separate time-column pipeline above, not this one.
-      2. Text values that contain a date separator and parse cleanly via
-         pandas (see _parses_as_date_string) -- this deliberately excludes
-         plain digit strings so ID/flight-number/pax-count columns are
-         never converted just because they're numeric.
-    ALL sampled non-null values must match for the column to be treated as
-    a date column, so a column that's mostly free text is left alone even
-    if one value happens to be parseable.
+         np.datetime64) -- unambiguous, always counted.
+      2. datetime.time values (clock times, no date component) are
+         excluded -- those belong to the separate time-column pipeline,
+         not this one.
+      3. Text values that _parse_flexible_date can confidently parse under
+         EITHER day-first or month-first assumption (the actual convention
+         is resolved separately by _infer_dayfirst_for_series once the
+         column is confirmed to be date-like).
+    ALL sampled non-null, non-time values must match for the column to be
+    treated as a date column, so a column that's mostly free text is left
+    alone even if one value happens to be parseable.
     """
-    import datetime  # local import: avoids clashing with the module-level
-                      # "from datetime import datetime" used further down
-                      # for the folder-workflow timestamp logic.
-    sample = series.dropna()
+    sample = series.dropna().head(20)
     if len(sample) == 0:
         return False
-    sample = sample.head(20)
     hits = 0
+    checked = 0
     for v in sample:
-        if isinstance(v, datetime.time):
-            continue
-        if isinstance(v, (pd.Timestamp, datetime.datetime, datetime.date, np.datetime64)):
+        if isinstance(v, _dt.time):
+            continue  # belongs to the separate time-column pipeline
+        checked += 1
+        if isinstance(v, (pd.Timestamp, _dt.datetime, _dt.date, np.datetime64)):
             hits += 1
-        elif isinstance(v, str) and _parses_as_date_string(v.strip()):
+        elif not pd.isna(_parse_flexible_date(v, dayfirst=False)) or \
+                not pd.isna(_parse_flexible_date(v, dayfirst=True)):
             hits += 1
-    return hits == len(sample)
+    return checked > 0 and hits == checked
 
 
-def _to_mmddyyyy(v):
+def _to_mmddyyyy(v, dayfirst=False):
     """
     Convert a single date/datetime-like value to 'MM-DD-YYYY' text, with
-    the time-of-day component (hours/minutes/seconds/milliseconds) dropped
-    entirely. Non-date and missing values pass through unchanged.
+    the time-of-day component dropped entirely. Non-date, unparseable, and
+    missing values pass through UNCHANGED (see the module-level docstring
+    for exactly which formats are deliberately left unparsed).
     """
-    import datetime  # local import: see note in _looks_like_date_series
-    if v is None:
-        return v
-    if isinstance(v, float) and pd.isna(v):
-        return v
-    if isinstance(v, datetime.time):
+    if isinstance(v, _dt.time):
         return v  # not a date value -- leave untouched
-    if isinstance(v, (pd.Timestamp, datetime.datetime, datetime.date, np.datetime64, str)):
-        parsed = pd.to_datetime(v, errors="coerce")
-        if not pd.isna(parsed):
-            return parsed.strftime("%m-%d-%Y")
-    return v
+    parsed = _parse_flexible_date(v, dayfirst=dayfirst)
+    return parsed.strftime("%m-%d-%Y") if not pd.isna(parsed) else v
 
 
 def convert_date_columns_to_mmddyyyy(df, force_columns=None):
     """
     Detects date-related columns in `df` (dynamically via
     _looks_like_date_series, plus any explicit overrides passed in
-    `force_columns` or listed in FORCE_DATE_COLUMNS) and converts their
-    values to 'MM-DD-YYYY' text, dropping the time-of-day portion
-    completely. Returns a NEW dataframe -- does not mutate the input.
+    `force_columns` or listed in FORCE_DATE_COLUMNS), infers each column's
+    own day/month convention from unambiguous values in its own data (see
+    _infer_dayfirst_for_series), and converts values to 'MM-DD-YYYY' text,
+    dropping the time-of-day portion completely. Returns a NEW dataframe --
+    does not mutate the input.
+
+    Each column's convention is detected independently, so Sheet A and
+    Sheet B can each be resolved correctly even if one is DD/MM and the
+    other is MM/DD -- callers run this once per sheet.
 
     Columns that merely contain numbers (flight numbers, IDs, pax counts,
     etc.) are left completely untouched, since detection requires either a
-    real date/datetime object or a text value with an explicit date
-    separator that pandas can parse.
+    real date/datetime object or a text value that _parse_flexible_date can
+    confidently resolve.
     """
     df = df.copy()
     force = set(force_columns or []) | set(FORCE_DATE_COLUMNS)
     for col in df.columns:
         if col in force or _looks_like_date_series(df[col]):
-            df[col] = df[col].map(_to_mmddyyyy)
+            dayfirst = _infer_dayfirst_for_series(df[col])
+            if dayfirst is None:
+                dayfirst = DEFAULT_DAYFIRST_WHEN_AMBIGUOUS
+                print(f"[WARN] '{col}': no unambiguous day/month evidence in this "
+                      f"column -- defaulting to {'DD/MM' if dayfirst else 'MM/DD'}. "
+                      f"Double-check this column if it matters.")
+            else:
+                print(f"[INFO] '{col}': detected {'DD/MM' if dayfirst else 'MM/DD'} "
+                      f"from unambiguous values in the data.")
+            df[col] = df[col].map(lambda v: _to_mmddyyyy(v, dayfirst))
+    return df
+
+
+# ============================================================================
+# PERCENTAGE COLUMN DETECTION + CONVERSION (canonical "0.63%" text)
+# ============================================================================
+# Excel stores a percentage-formatted cell as a raw FRACTION (0.63% is
+# stored as 0.0063), with "%" applied purely as a display format that a
+# plain value read never exposes. A sheet that instead stores the same
+# percentage as literal TEXT ("0.63%") has no such hidden fraction -- the
+# string already IS the display value. Left alone, these two
+# representations of the identical real-world percentage would compare as
+# totally different values. This section converts BOTH into the same
+# canonical percent-text form so they compare equal.
+
+# Number of decimal places used for the canonical percent text, and for
+# re-rounding percent values already stored as text. Matches Excel's
+# common "0.00%" display format; change this if your sheets consistently
+# use a different precision (e.g. 1 for "0.00%" -> "0.0%", 0 for whole
+# percents like "63%").
+PERCENT_DECIMAL_PLACES = 2
+
+_PERCENT_TEXT_RE = re.compile(r"^([+-]?\d+(?:\.\d+)?)\s*%$")
+
+
+def _excel_round(value, decimal_places):
+    """
+    Round `value` to `decimal_places` using round-half-AWAY-FROM-ZERO --
+    the convention Excel itself uses for on-screen display. Python's
+    built-in round() uses round-half-TO-EVEN ("banker's rounding"), which
+    disagrees with Excel on exact halfway values: round(0.625, 2) is 0.62
+    in Python but Excel displays 0.63%. Uses Decimal(str(value)) rather
+    than Decimal(value) to avoid binary floating-point representation
+    artifacts (e.g. 0.615 sometimes being stored as slightly less than
+    0.615 under the hood).
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+    quantum = Decimal(1).scaleb(-decimal_places)  # e.g. Decimal('0.01') for 2 places
+    return float(Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP))
+
+
+def _percent_value_to_text(v, decimal_places=PERCENT_DECIMAL_PLACES):
+    """
+    Convert a raw Excel percent-formatted FRACTION (e.g. 0.00625, meaning
+    0.625%) into canonical percent text (e.g. "0.63%"), rounding to
+    `decimal_places` using Excel's own round-half-away-from-zero
+    convention (see _excel_round). Non-numeric and missing values pass
+    through unchanged.
+    """
+    if v is None or (isinstance(v, float) and _is_nan(v)):
+        return v
+    if isinstance(v, bool):
+        return v  # guard: bool is a subclass of int in Python
+    if isinstance(v, (int, float)):
+        return f"{_excel_round(v * 100, decimal_places):.{decimal_places}f}%"
+    return v
+
+
+def _normalize_percent_text(v, decimal_places=PERCENT_DECIMAL_PLACES):
+    """
+    Round an ALREADY-percent-suffixed text value (e.g. "0.630%", "0.63 %")
+    to the same canonical decimal precision used by _percent_value_to_text,
+    so a sheet that stores percentages as literal text still compares
+    equal to a sheet that stores them as percent-formatted numbers, even
+    if the two differ only in trailing-zero style. Values that don't match
+    the "<number>%" text pattern pass through unchanged.
+    """
+    if not isinstance(v, str):
+        return v
+    m = _PERCENT_TEXT_RE.match(v.strip())
+    if not m:
+        return v
+    number = float(m.group(1))
+    return f"{_excel_round(number, decimal_places):.{decimal_places}f}%"
+
+
+def convert_percent_columns_to_text(df, percent_mask=None):
+    """
+    Converts every cell flagged in `percent_mask` (a same-shape boolean
+    DataFrame produced by load_sheet()'s percent-format detection) from
+    its raw Excel fraction (e.g. 0.00625) into canonical percent text
+    (e.g. "0.63%"). Also re-rounds any column that ALREADY holds literal
+    percent-suffixed text to the same decimal precision, so text-based and
+    numeric-format percentages -- whether from the same sheet or two
+    different sheets -- compare equal instead of looking like two
+    different values for the same real quantity. Returns a NEW dataframe
+    -- does not mutate the input.
+
+    If `percent_mask` is None (the CSV loading path, which carries no
+    cell-format metadata at all), only the text re-rounding step runs --
+    a bare numeric percentage in a CSV (e.g. "0.0063" with no "%" and no
+    formatting information) is indistinguishable from an ordinary decimal
+    number and is intentionally left untouched.
+    """
+    df = df.copy()
+    for col in df.columns:
+        if percent_mask is not None and col in percent_mask.columns:
+            mask = percent_mask[col].fillna(False).to_numpy()
+            if mask.any():
+                # Rebuild the column as a plain Python list rather than a
+                # masked in-place assignment: a column that loaded as pure
+                # float64 (no text mixed in) locks pandas to that dtype,
+                # and assigning percent-text strings into a subset of it
+                # raises a LossySetitemError. Replacing the whole column
+                # at once lets pandas re-infer dtype (-> object) safely.
+                values = df[col].tolist()
+                df[col] = [
+                    _percent_value_to_text(v) if flagged else v
+                    for v, flagged in zip(values, mask)
+                ]
+        # Re-round any value that's ALREADY percent-suffixed text -- covers
+        # CSV-sourced percentages and the just-converted cells above alike.
+        df[col] = df[col].map(_normalize_percent_text)
     return df
 
 
@@ -507,32 +863,24 @@ def _normalize_time_value(v):
     return v
 
 
-def _normalize_date_value(v):
+def _normalize_date_value(v, dayfirst=False):
     """
     Return MM-DD-YYYY for real datetimes and date-like text (time-of-day
-    dropped entirely), so comparison never treats two different times on
-    the same date as a mismatch.
+    dropped entirely), using the same multi-format parser as
+    convert_date_columns_to_mmddyyyy() (see _parse_flexible_date). Values it
+    can't confidently parse pass through unchanged.
 
     NOTE: by the time this runs inside normalize_dataframe(), date columns
     have typically already been converted to 'MM-DD-YYYY' strings by
     convert_date_columns_to_mmddyyyy() upstream (see run_comparison /
-    run_folder_comparison). This function is kept so compare_data() /
-    normalize_dataframe() still behave correctly on their own, and so any
-    date-like value that slipped through unconverted is still normalized
-    consistently at comparison time.
+    run_folder_comparison), so `dayfirst` here is just a safety-net default
+    for any date-like value that slipped through unconverted -- it does not
+    re-decide the convention for columns already normalized upstream.
     """
-    import datetime
-
-    if isinstance(v, (pd.Timestamp, datetime.datetime, datetime.date, np.datetime64)):
-        parsed = pd.to_datetime(v, errors="coerce")
-        return parsed.strftime("%m-%d-%Y") if not pd.isna(parsed) else v
-    # Restrict text parsing to values that look like dates (contain a date
-    # separator), so ordinary identifiers and free text are never
-    # accidentally converted to dates.
-    if isinstance(v, str) and _parses_as_date_string(v.strip()):
-        parsed = pd.to_datetime(v.strip(), errors="coerce")
-        return parsed.strftime("%m-%d-%Y") if not pd.isna(parsed) else v
-    return v
+    if isinstance(v, _dt.time):
+        return v
+    parsed = _parse_flexible_date(v, dayfirst=dayfirst)
+    return parsed.strftime("%m-%d-%Y") if not pd.isna(parsed) else v
 
 
 def _normalize_numeric_like(v):
@@ -573,12 +921,25 @@ def _normalize_numeric_like(v):
     return v
 
 
+# Text values that should be treated as equivalent to a genuinely blank/
+# NULL cell during comparison (case-insensitive, whitespace-insensitive).
+# Some exports write one of these literal strings instead of leaving the
+# cell truly empty, and to a reviewer they mean the same thing: "no value
+# here". Extend this list if your source data uses other placeholder text.
+NULL_LIKE_TEXT_VALUES = {"null", "n/a", "na", "none", "nan", "nat", "#n/a"}
+
+
 def _normalize_value(v, strip_whitespace):
     """
     General-purpose value normalization applied to every cell before
     comparison:
-      - Missing values (None/NaN/NaT) become the MISSING sentinel, so they
-        group together with each other, distinct from "" or the text "None".
+      - Missing values (None/NaN/NaT) become an empty string "", so a
+        genuinely blank/NULL cell on one side compares equal to an empty
+        string on the other side (they are treated as the same value).
+      - Text placeholders for "no value" (see NULL_LIKE_TEXT_VALUES --
+        e.g. the literal text "NULL", "N/A", "None") are ALSO normalized
+        to "", so a cell that holds that text on one side still matches a
+        truly blank/NULL/"" cell on the other side.
       - Strings optionally have leading/trailing whitespace stripped,
         controlled by STRIP_WHITESPACE_IN_DATA_VALUES.
       - EVERYTHING ELSE is cast to str(). This is a deliberate safety net:
@@ -593,17 +954,20 @@ def _normalize_value(v, strip_whitespace):
         through unconverted.
     """
     if v is None:
-        return _MISSING_SENTINEL
+        return ""
     if isinstance(v, float) and pd.isna(v):
-        return _MISSING_SENTINEL
+        return ""
     try:
         if pd.isna(v):
-            return _MISSING_SENTINEL
+            return ""
     except (TypeError, ValueError):
         pass  # pd.isna can choke on some object types; safe to ignore
 
     if isinstance(v, str):
-        return v.strip() if strip_whitespace else v
+        s = v.strip() if strip_whitespace else v
+        if s.strip().lower() in NULL_LIKE_TEXT_VALUES or s.strip() == "":
+            return ""
+        return s
 
     return str(v)  # safety net -- see docstring above
 
@@ -665,7 +1029,7 @@ def normalize_dataframe(df, columns, apply_numeric_normalization=True,
 # STEP 3: DATA COMPARISON (multiset / bag comparison)
 # ============================================================================
 
-def compare_data(df_a, df_b, common_columns, tableau_previous_value_fill=True,
+def compare_data(df_a, df_b, common_columns, tableau_previous_value_fill=False,
                  autofilled_cells_a=None, autofilled_cells_b=None,
                  display_df_a=None, display_df_b=None):
     """
@@ -695,11 +1059,21 @@ def compare_data(df_a, df_b, common_columns, tableau_previous_value_fill=True,
         'extra_in_b' : same, reversed.
     """
     # --- normalize both sides identically before grouping ---
-    # A report-style export can use a blank cell to mean "same as the row
-    # above".  This must be applied to BOTH sources: doing it only for the
-    # Tableau side makes two equivalent physical representations compare as
-    # different row tuples.  The legacy argument is retained for callers
-    # that explicitly need to disable this comparison-time behavior.
+    # NOTE: tableau_previous_value_fill defaults to False. This is a
+    # separate, comparison-time-only "treat blank as same as row above"
+    # step that used to run unconditionally on EVERY common column,
+    # regardless of which columns the user actually chose in the
+    # interactive autofill prompt (or FORWARD_FILL_COLUMNS). That silently
+    # overrode the user's column selection at comparison time, and could
+    # also replace a genuinely-missing NULL cell with a copied prior value
+    # instead of letting it normalize to "" -- causing false mismatches
+    # against a legitimately blank/"" cell on the other side. The real,
+    # user-controlled autofill already happened earlier during
+    # preprocessing (_preprocess_and_save -> prompt_for_autofill /
+    # FORWARD_FILL_COLUMNS) and is already baked into df_a/df_b by this
+    # point. Only pass True here if you explicitly want this ADDITIONAL,
+    # comparison-only "same as row above" behavior applied to every
+    # common column on top of that.
     norm_a = normalize_dataframe(df_a, common_columns,
                                  apply_previous_value_fill=tableau_previous_value_fill)
     norm_b = normalize_dataframe(df_b, common_columns,
@@ -746,39 +1120,34 @@ def compare_data(df_a, df_b, common_columns, tableau_previous_value_fill=True,
     # human review it's more useful to show the actual original data. We do
     # this by taking one representative original row per matched normalized
     # tuple from the sheet that has extra copies.
-    extra_in_a = _attach_original_values(
-        extra_in_a, display_df_a if display_df_a is not None else df_a,
-        common_columns, norm_a, autofilled_cells_a
+    extra_in_a = _attach_after_fill_values(
+    extra_in_a, common_columns, norm_a, autofilled_cells_a
     )
-    extra_in_b = _attach_original_values(
-        extra_in_b, display_df_b if display_df_b is not None else df_b,
-        common_columns, norm_b, autofilled_cells_b
+    extra_in_b = _attach_after_fill_values(
+        extra_in_b, common_columns, norm_b, autofilled_cells_b
     )
 
     return {"extra_in_a": extra_in_a, "extra_in_b": extra_in_b}
 
 
-def _attach_original_values(result_df, original_df, common_columns, normalized_df,
-                            autofilled_cells=None):
+def _attach_after_fill_values(result_df, common_columns, normalized_df, autofilled_cells=None):
     """
-    result_df currently holds NORMALIZED values for common_columns (since it
-    came from grouping on normalized_df) plus CountInA/CountInB. Replace the
-    normalized values with one representative row of ORIGINAL (pre-
-    normalization) values from original_df, so the output is readable real
-    data rather than sentinel-substituted/type-coerced strings.
+    result_df currently holds NORMALIZED values for common_columns plus
+    CountInA/CountInB. Replace them with one representative row of the
+    AFTER-FILL (post-normalization) values from normalized_df -- i.e. the
+    exact values that were actually compared -- instead of going back to
+    the pre-fill original.
     """
     if result_df.empty:
         result_df = result_df.reset_index(drop=True)
         result_df.attrs["autofilled_columns_by_row"] = {}
         return result_df
 
-    # Attach a temporary key to normalized_df so we can look up, per
-    # normalized tuple, the index of one matching original row.
     normalized_df = normalized_df.copy()
     normalized_df["_orig_index"] = normalized_df.index
 
-    # First matching original row per normalized tuple (any one instance is
-    # representative -- they're duplicates of each other after all).
+    # First matching normalized row per normalized tuple (duplicates are
+    # identical after normalization, so any one instance is representative).
     first_match = normalized_df.drop_duplicates(subset=common_columns, keep="first")
 
     lookup = pd.merge(
@@ -788,18 +1157,24 @@ def _attach_original_values(result_df, original_df, common_columns, normalized_d
         how="left",
     )
 
-    orig_rows = original_df.loc[lookup["_orig_index"]].reset_index(drop=True)
-    orig_rows["CountInA"] = lookup["CountInA"].values
-    orig_rows["CountInB"] = lookup["CountInB"].values
-    # NEW: AUTO-FILL TRACKING
-    # Keep display-only provenance outside the dataframe columns so the
-    # generated workbook structure remains exactly unchanged.
+    if lookup["_orig_index"].isna().any():
+        missing = lookup[lookup["_orig_index"].isna()]
+        raise ValueError(
+            f"_attach_after_fill_values: no matching row found for {len(missing)} group(s)."
+        )
+
+    # Pull the AFTER-FILL row directly -- no trip back to the original df.
+    after_fill_rows = normalized_df.loc[lookup["_orig_index"], common_columns].reset_index(drop=True)
+    after_fill_rows["CountInA"] = lookup["CountInA"].values
+    after_fill_rows["CountInB"] = lookup["CountInB"].values
+
     tracked = autofilled_cells or set()
-    orig_rows.attrs["autofilled_columns_by_row"] = {
+    after_fill_rows.attrs["autofilled_columns_by_row"] = {
         output_row: {column for column, source_row in tracked if source_row == original_row}
         for output_row, original_row in enumerate(lookup["_orig_index"])
     }
-    return orig_rows
+
+    return after_fill_rows
 
 
 # ============================================================================
@@ -1414,10 +1789,10 @@ def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison
     # Keep untouched display copies separate from the working comparison
     # copies.  The latter expand merged cells; the former are used only when
     # writing human-readable difference rows.
-    display_df_a = load_sheet(path_a, sheet_a)
-    display_df_b = load_sheet(path_b, sheet_b)
-    df_a = load_sheet(path_a, sheet_a, expand_powerbi_merges=True)
-    df_b = load_sheet(path_b, sheet_b, expand_powerbi_merges=True)
+    display_df_a, _ = load_sheet(path_a, sheet_a)
+    display_df_b, _ = load_sheet(path_b, sheet_b)
+    df_a, percent_mask_a = load_sheet(path_a, sheet_a, expand_powerbi_merges=True)
+    df_b, percent_mask_b = load_sheet(path_b, sheet_b, expand_powerbi_merges=True)
     autofilled_cells_a = set()
     autofilled_cells_b = set()
     if interactive_autofill:
@@ -1431,9 +1806,17 @@ def run_comparison(path_a, path_b, sheet_a=0, sheet_b=0, output_path="comparison
         autofilled_cells_b.update(configured_cells_b)
     # Convert date/datetime columns to MM-DD-YYYY (time dropped) before the
     # rest of the pipeline runs, so schema/row-count/data comparison all see
-    # the normalized date representation.
+    # the normalized date representation. Each sheet's own day/month
+    # convention is inferred independently -- see convert_date_columns_to_mmddyyyy.
     df_a = convert_date_columns_to_mmddyyyy(df_a)
     df_b = convert_date_columns_to_mmddyyyy(df_b)
+    # Convert percent-formatted numeric cells (and already-text percentages)
+    # to the same canonical "0.63%" text form on both sides -- see the
+    # PERCENTAGE COLUMN DETECTION + CONVERSION section for why this is
+    # needed (Excel stores a percent-formatted cell as a raw fraction,
+    # invisible to a plain value read).
+    df_a = convert_percent_columns_to_text(df_a, percent_mask_a)
+    df_b = convert_percent_columns_to_text(df_b, percent_mask_b)
     print(f"Sheet A: {path_a!r} (sheet={sheet_a!r}) -> {df_a.shape[0]} rows, {df_a.shape[1]} cols")
     print(f"Sheet B: {path_b!r} (sheet={sheet_b!r}) -> {df_b.shape[0]} rows, {df_b.shape[1]} cols")
 
@@ -1561,12 +1944,22 @@ from pathlib import Path
 from datetime import datetime
 
 # ---- EDIT THESE FOLDER PATHS ONCE, THEN NEVER TOUCH THEM AGAIN ----
-TABLEAU_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\NeedToTestTBL")
-POWERBI_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\NeedToTestPBI")
-ARCHIVE_TABLEAU_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Tableau_Archive")
-ARCHIVE_POWERBI_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Powerbi_Archive")
-RESULT_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Comparision_Tbl_PBI")
- 
+# TABLEAU_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\NeedToTestTBL")
+# POWERBI_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\NeedToTestPBI")
+# ARCHIVE_TABLEAU_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Tableau_Archive")
+# ARCHIVE_POWERBI_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Powerbi_Archive")
+# RESULT_FOLDER = Path(r"D:\Blick_Tickets\Microsft_fabric\Data_Validations_Tableau_Powerbi\Comparision_Tbl_PBI")
+
+BASE_FOLDER = Path(__file__).resolve().parent
+
+TABLEAU_FOLDER = BASE_FOLDER / "NeedToTestTBL"
+POWERBI_FOLDER = BASE_FOLDER / "NeedToTestPBI"
+
+ARCHIVE_TABLEAU_FOLDER = BASE_FOLDER / "Tableau_Archive"
+ARCHIVE_POWERBI_FOLDER = BASE_FOLDER / "Powerbi_Archive"
+
+RESULT_FOLDER = BASE_FOLDER / "Comparision_Tbl_PBI"
+
 # File extensions to look for when auto-discovering the file in each folder.
 VALID_EXTENSIONS = (".xlsx", ".xls", ".csv")
 
@@ -1600,10 +1993,15 @@ def _find_single_file(folder):
 
 
 def _load_any(path, sheet_name=0, expand_powerbi_merges=False):
-    """Reads .xlsx/.xls via load_sheet(), or .csv directly, based on extension."""
+    """
+    Reads .xlsx/.xls via load_sheet(), or .csv directly, based on
+    extension. Always returns (dataframe, percent_format_mask) -- the mask
+    is None for CSV, since CSV carries no cell-formatting metadata at all
+    (see convert_percent_columns_to_text).
+    """
     path = Path(path)
     if path.suffix.lower() == ".csv":
-        return pd.read_csv(path, dtype=object)
+        return pd.read_csv(path, dtype=object), None
     return load_sheet(path, sheet_name, expand_powerbi_merges=expand_powerbi_merges)
 
 
@@ -1619,7 +2017,7 @@ def _preprocess_and_save(path, sheet_index, sheet_label, interactive_autofill,
     what was written to disk) so the caller doesn't need to re-read the
     file.
     """
-    df = _load_any(path, sheet_index, expand_powerbi_merges=expand_powerbi_merges)
+    df, percent_mask = _load_any(path, sheet_index, expand_powerbi_merges=expand_powerbi_merges)
     autofilled_cells = set()
     if interactive_autofill:
         df, autofilled_cells = prompt_for_autofill(df, sheet_label)
@@ -1628,6 +2026,7 @@ def _preprocess_and_save(path, sheet_index, sheet_label, interactive_autofill,
         df, configured_cells = forward_fill_merged_cells(df, FORWARD_FILL_COLUMNS)
         autofilled_cells.update(configured_cells)
     df = convert_date_columns_to_mmddyyyy(df)
+    df = convert_percent_columns_to_text(df, percent_mask)
     save_dataframe_to_source(df, path, sheet_index)
     return df, autofilled_cells
 
@@ -1681,8 +2080,8 @@ def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
     # copies below may expand merges, forward-fill report blanks, and convert
     # dates before grouping, but those transformations must not replace the
     # values a reviewer sees in ExtraInA/ExtraInB and mismatch reports.
-    display_df_a = _load_any(path_a, sheet_a_index)
-    display_df_b = _load_any(path_b, sheet_b_index)
+    display_df_a, _ = _load_any(path_a, sheet_a_index)
+    display_df_b, _ = _load_any(path_b, sheet_b_index)
 
     now = datetime.now()
     date_str = now.strftime("%Y%m%d")
@@ -1696,7 +2095,7 @@ def run_folder_comparison(sheet_a_index=0, sheet_b_index=0,
     print("=" * 70)
     df_a, autofilled_cells_a = _preprocess_and_save(
         path_a, sheet_a_index, "SheetA", interactive_autofill,
-        expand_powerbi_merges=True,
+        expand_powerbi_merges=False,
     )
 
     print("\n" + "=" * 70)
